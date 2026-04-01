@@ -2,7 +2,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue.svg)
 ![Playwright](https://img.shields.io/badge/Playwright-Async-green.svg)
-![Linting](https://img.shields.io/badge/Lint-Ruff-orange.svg)
 
 A robust, highly concurrent, headless Playwright scraper. It safely bypasses Amazon's Google Workspace login restrictions to accurately aggregate store-level performance metrics (such as **Late Picks**, **UPH**, **Order Volume**, and **Cancellations**) directly from internal metric API endpoints and rendering UI panels, all without breaking on regional variation.
 
@@ -99,18 +98,6 @@ You do not need to use `config.json` manually anymore; configuration has been mi
 
 ---
 
-## 🛠 Development & Code Quality
-
-This project enforces `ruff` logic for maintaining highly readable, pristine code architectures.
-
-**Before pushing changes** to this repository, ensure your code matches style semantics by verifying it locally:
-```bash
-ruff check .
-ruff format .
-```
-The automated CI checks in GitHub Actions perform lint validations natively and will abort bad formatting requests before wasting Playwright run cycles.
-
----
 
 ## 🔄 GitHub Actions Workflows
 
@@ -118,7 +105,6 @@ This system is automatically scheduled natively inside `.github/workflows/run-sc
 
 The execution lifecycle consists of:
 1. `check-time`: A bash-script validating the current hour against `UK_TARGET_HOURS` to prevent off-hour spam.
-2. `lint-code`: Verifies the code hasn't been improperly written.
-3. `scrape-and-submit`: Collects variables safely masked within the Github Secrets repository and maps them automatically onto the `scraper.py` execution via native execution wrappers.
+2. `scrape-and-submit`: Collects variables safely masked within the Github Secrets repository and maps them automatically onto the `scraper.py` execution via native execution wrappers.
 
 The persistent state (like login cookie sessions and mid-discovery arrays) rotates across GitHub Artifacts automatically, retaining authentication history spanning multiple days.

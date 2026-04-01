@@ -8,5 +8,4 @@ certifi
 aiofiles
 pydantic
 pydantic-settings
-ruff
 python-dotenv
