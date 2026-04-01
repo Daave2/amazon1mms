@@ -1193,32 +1193,37 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                 total_orders = sum(float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) for m in masters)
                 total_units  = sum(float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) for m in masters)
                 total_fulfilled = sum(float(m.get('metrics', {}).get('PickedUnits_V2', 0)) for m in masters)
+                total_cancellations = sum(float(m.get('metrics', {}).get('OrderCancellations', 0)) for m in masters)
                 
                 # Weighted UPH calculation
                 total_time_ms = sum(float(m.get('metrics', {}).get('TimeAvailable_V2', 0)) for m in masters)
                 uph = (total_units / (total_time_ms / 3600000)) if total_time_ms > 0 else 0.0
 
-                # Weighted Lates calculation
-                total_lates_count = sum(
-                    float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) * (float(m.get('metrics', {}).get('UnacceptedRate_V2', 0)) / 100)
+                # Weighted Late Picks calculation (matching dashboard "Late Picks")
+                total_late_picks_count = sum(
+                    float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) * (float(m.get('metrics', {}).get('LatePicksRate', 0)) / 100)
                     for m in masters
                 )
-                lates_rate = (total_lates_count / total_orders * 100) if total_orders > 0 else 0.0
+                late_picks_rate = (total_late_picks_count / total_orders * 100) if total_orders > 0 else 0.0
                 
                 data_to_use = {
                     'OrdersShopped_V2': total_orders,
                     'RequestedQuantity_V2': total_units,
                     'PickedUnits_V2': total_fulfilled,
+                    'OrderCancellations': total_cancellations,
                     'AverageUPH_V2': uph,
-                    'UnacceptedRate_V2': lates_rate,
+                    'LatePicksRate': late_picks_rate,
                     'TimeAvailable_V2': total_time_ms
                 }
             else:
                 data_to_use = api_data
 
-            lates_val = data_to_use.get('UnacceptedRate_V2', data_to_use.get('metrics', {}).get('UnacceptedRate_V2', 0.0))
+            # Prioritize LatePicksRate from JSON
+            lates_val = data_to_use.get('LatePicksRate', data_to_use.get('metrics', {}).get('LatePicksRate', 0.0))
             formatted_lates = f"{lates_val:.1f} %"
-            app_logger.info(f"[{store_name}] 'Lates' extracted from API JSON: {formatted_lates}")
+            
+            cancellations_val = data_to_use.get('OrderCancellations', data_to_use.get('metrics', {}).get('OrderCancellations', 0))
+            app_logger.info(f"[{store_name}] Metrics extracted: Lates={formatted_lates}, Cancellations={cancellations_val}")
 
             # --- Compute Time Available from API ---
             milliseconds_from_api = float(data_to_use.get('TimeAvailable_V2', 0.0))
