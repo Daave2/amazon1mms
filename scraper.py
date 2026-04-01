@@ -1101,19 +1101,13 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             if api_url_template and merchant_id:
                 try:
                     target_url = api_url_template.replace("{merchant_id}", merchant_id)
-                    app_logger.info(f"[{store_name}] FAST PATH: Fetching data from API directly via navigation...")
-                    
-                    # Create a temporary page to fetch the JSON directly (avoids CORS issues with fetch)
-                    temp_page = await page.context.new_page()
-                    try:
-                        resp = await temp_page.goto(target_url, timeout=METRICS_TIMEOUT)
-                        if resp and resp.status == 200:
-                            api_data = await resp.json()
-                            app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
-                        else:
-                            raise Exception(f"API Fetch failed: {resp.status if resp else 'No response'}")
-                    finally:
-                        await temp_page.close()
+                    app_logger.info(f"[{store_name}] FAST PATH: Executing direct context API fetch...")
+                    resp = await page.context.request.get(target_url)
+                    if resp.status == 200:
+                        api_data = await resp.json()
+                        app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
+                    else:
+                        raise Exception(f"API Fetch failed: {resp.status}")
                 except Exception as api_err:
                     app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Falling back to UI.")
                     api_data = None
