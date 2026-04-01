@@ -1,5 +1,5 @@
 import json
-import sys
+
 
 def dict_raise_on_duplicates(ordered_pairs):
     d = {}
@@ -9,8 +9,9 @@ def dict_raise_on_duplicates(ordered_pairs):
         d[k] = v
     return d
 
+
 try:
-    with open('config.example.json', 'r') as f:
+    with open("config.example.json") as f:
         json.load(f, object_pairs_hook=dict_raise_on_duplicates)
     print("No duplicates found.")
 except Exception as e:

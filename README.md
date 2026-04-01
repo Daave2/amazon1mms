@@ -1,97 +1,51 @@
-# Amazon Seller Central Scraper (1MMS)
+# Amazon 1MMS Dashboard Scraper
 
-This repository contains an asynchronous scraper built with Playwright. It logs
-into Amazon Seller Central, collects dashboard metrics for a list of stores and
-submits them to a Google Form so they can be aggregated in Google Sheets.
+A robust, headless Playwright scraper that bypasses Amazon's Google login requirements to accurately aggregate 'Late Picks', 'UPH', and volume data directly from internal metric API endpoints (or dynamically rendered UI panels) without breaking on regional variation.
 
-This is the **1MMS** (single Merchant Management System) version, which uses a
-single dashboard page with a store-selection dropdown instead of navigating to
-individual store URLs.
+## Architecture Structure
 
-The code may be executed locally or through the included GitHub Actions
-workflow.
+The application has been overhauled for extreme maintainability, strictly following a core-services separation.
 
+- `scraper.py` — The primary orchestrator. Bootstraps Chromium, creates the async workload pool, dynamically loads URLs, and waits for successful completion.
+- `core/config.py` — Defines configuration schemas (using `pydantic-settings`). Exits loudly if critical environment variables are missing.
+- `core/logger.py` — Handles rotating local file logging and automatic timezone localization (Europe/London).
+- `core/state.py` — A thread-safe container storing queue lengths, error messages, and dynamic state cache without utilizing unprotected globals.
+- `core/schemas.py` — Extremely strict `pydantic` schemas for Amazon's HTTP JSON payloads, preventing Silent 0 errors if an API property drops.
+- `services/auth_service.py` — Encapsulates the Google Bypass, email/password entry, and 1MMS Merchant picker selection loop.
+- `services/metrics_service.py` — Injects Amazon's internal APIs natively. Intercepts dashboard data or forces UI refreshes for target data collection natively.
+- `services/forms_service.py` — Transforms normalized metric objects and pushes POST requests to the downstream Google Forms spreadsheet hook asynchronously.
+- `services/chat_service.py` — Orchestrates dynamic Google Workspace Chat Cards outlining queue duration and error breakpoints seamlessly.
 
+## Setting Up Locally
 
-## Table of Contents
-
-- [Features](#features)
-- [Requirements](#requirements)
-- [Local Setup](#local-setup)
-- [Running Locally](#running-locally)
-- [GitHub Actions Workflow](#github-actions-workflow)
-- [Configuration Reference](#configuration-reference)
-- [Notes](#notes)
-
-## Features
-
-- Collects metrics for multiple stores listed in `urls.csv`
-- Uses a single dashboard page with store-selection dropdown (1MMS approach)
-- Posts metrics to a configurable Google Form (12 fields)
-- Supports configurable concurrency and automatic adjustments based on system load
-- Produces structured logs in `output/` and rotates `app.log`
-- Optionally posts progress to Google Chat using collapsible cards grouped by timestamped batches. 
-- Chat messages are tagged with **(1MMS)** for easy identification
-- **Enhanced Job Summary**: Sends a detailed post-run report to Google Chat including:
-  - High-level stats (Throughput, Success Rate, Duration)
-  - Business Volume (Total Orders, Units)
-  - Resilience Metrics (Retries, Stores Retried)
-  - Speed Breakdown (Avg Collection Time, p95 Latency, Bottleneck Analysis)
-  - Failure Analysis (Breakdown by error type and list of failed stores)
-
-## Requirements
-
-- Python 3.11
-- Playwright with Chromium browsers
-- See `requirements.txt` for the full list of Python packages
-
-## Local Setup
-
-1. Install Python dependencies:
-
+You do not need to use `config.json` manually anymore.
+1. Install requirements: `pip install -r requirements.txt`
+2. Create your environment configuration based on the example:
    ```bash
-   pip install -r requirements.txt
-   python -m playwright install chromium
+   cp .env.example .env
+   ```
+3. Update `.env` with your Amazon credentials and Google Webhook URLs.
+4. Execute:
+   ```bash
+   python scraper.py
    ```
 
-2. Copy the example configuration and edit it with your credentials:
+## Development & Code Quality
 
-   ```bash
-   cp config.example.json config.json
-   # then edit config.json
-   ```
+This project enforces `ruff` logic. 
 
-   Important fields include your Seller Central login details, the target Google Form URL, and concurrency settings. The example file contains all available keys.
-
-3. Populate `urls.csv` with the stores you want to scrape. Each row uses the following columns:
-   `merchant_id,new_id,store_name,marketplace_id`.
-
-## Running Locally
-
-Execute the scraper from the command line:
-
+**Before pushing changes** to this repository, ensure your code matches style semantics by typing:
 ```bash
-python scraper.py
+ruff check .
+ruff format .
 ```
+The automated CI checks in GitHub Actions perform lint validations natively and will abort bad formatting requests before wasting Playwright run cycles.
 
-Logs and submission data will be saved under the `output/` directory.
+## GitHub Actions
 
-## GitHub Actions Workflow
+This system is configured using `.github/workflows/run-scraper.yml`.
+The job is separated into two blocks:
+1. `lint-code`: Verifies the code hasn't been improperly written.
+2. `scrape-and-submit`: Collects variables safely masked locally securely within the Github Secrets repository and maps them automatically onto the `scraper.py` context via native Environment Variable mappings bypassing explicit config.json drops.
 
-The workflow defined in `.github/workflows/run-scraper.yml` installs dependencies,
-creates a `config.json` from repository secrets and runs the scraper on a
-schedule. It checks the current UK time against `UK_TARGET_HOURS` to decide
-whether to proceed with a run.
-
-Artifacts such as logs are uploaded for each run and kept for seven days.
-
-## Configuration Reference
-
-Key options from `config.example.json`:
-
-See the example file for full details.
-
-## Notes
-
-The repository excludes `config.json`, `state.json`, and `output/` from version control. These files may contain sensitive information or large log data. Ensure you keep your credentials secure.
-Timestamps recorded by the scraper default to the Europe/London timezone. Modify the `LOCAL_TIMEZONE` constant in `scraper.py` if you prefer a different local time.
+The persistent state (like login cookie sessions and mid-discovery arrays) rotates across artifacts automatically.

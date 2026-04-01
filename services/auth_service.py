@@ -1,14 +1,24 @@
-import re
 import json
-import pyotp
-from playwright.async_api import Page, expect, TimeoutError, Error as PlaywrightError
+import re
 from typing import Any
+
+import pyotp
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, TimeoutError, expect
+
+from core.config import (
+    ACTION_TIMEOUT,
+    DEBUG_MODE,
+    LOGIN_EMAIL,
+    LOGIN_PASSWORD,
+    LOGIN_URL,
+    OTP_SECRET_KEY,
+    PAGE_TIMEOUT,
+    STORAGE_STATE,
+)
 from core.logger import app_logger
 from core.utils import save_screenshot
-from core.config import (
-    LOGIN_URL, PAGE_TIMEOUT, DEBUG_MODE, LOGIN_EMAIL, LOGIN_PASSWORD,
-    OTP_SECRET_KEY, STORAGE_STATE, ACTION_TIMEOUT
-)
+
 
 async def check_if_login_needed(page: Page, test_url: str) -> bool:
     app_logger.info(f"Verifying session status by navigating to: {test_url}")
@@ -16,7 +26,7 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         await page.goto(test_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
         login_selector = "input#ap_email, input#ap_password, input[name='email']"
         dashboard_selector = "#content > div > div.mainAppContainerExternal"
-        
+
         try:
             found = await page.locator(f"{login_selector}, {dashboard_selector}").first.is_visible(timeout=10000)
             if not found:
@@ -31,15 +41,16 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         if await page.locator(login_selector).first.is_visible():
             app_logger.info("Login form detected.")
             return True
-            
+
         if await page.locator(dashboard_selector).is_visible():
             app_logger.info("Dashboard detected. Session is valid.")
             return False
-            
+
         return True
     except Exception as e:
         app_logger.error(f"Error during session check: {e}", exc_info=DEBUG_MODE)
         return True
+
 
 async def perform_login_and_otp(page: Page) -> bool:
     app_logger.info(f"Navigating to login page: {LOGIN_URL}")
@@ -48,17 +59,19 @@ async def perform_login_and_otp(page: Page) -> bool:
         app_logger.info("Initial page loaded. Determining login flow...")
 
         continue_shopping_selector = 'button:has-text("Continue shopping")'
-        email_field_selector = 'input#ap_email'
+        email_field_selector = "input#ap_email"
 
-        await page.wait_for_selector(f"{continue_shopping_selector}, {email_field_selector}", state="visible", timeout=15000)
-        
+        await page.wait_for_selector(
+            f"{continue_shopping_selector}, {email_field_selector}", state="visible", timeout=15000
+        )
+
         if await page.locator(continue_shopping_selector).is_visible():
             app_logger.info("Flow: Interstitial 'Continue shopping' page detected. Clicking it.")
             await page.locator(continue_shopping_selector).click()
             await expect(page.locator(email_field_selector)).to_be_visible(timeout=15000)
         else:
             app_logger.info("Flow: Login form with email field loaded directly.")
-        
+
         email_locator = page.locator(email_field_selector)
         try:
             await email_locator.fill(LOGIN_EMAIL, timeout=10000)
@@ -93,7 +106,9 @@ async def perform_login_and_otp(page: Page) -> bool:
                             await visible_locator.click()
                             return True
                 except PlaywrightError as inner_error:
-                    app_logger.debug(f"Encountered error while handling alternate sign-in option: {inner_error}", exc_info=DEBUG_MODE)
+                    app_logger.debug(
+                        f"Encountered error while handling alternate sign-in option: {inner_error}", exc_info=DEBUG_MODE
+                    )
                 return False
 
             bypass_attempted = False
@@ -122,7 +137,7 @@ async def perform_login_and_otp(page: Page) -> bool:
             await expect(password_field).to_be_visible(timeout=10000)
         await password_field.fill(LOGIN_PASSWORD)
         await page.get_by_label("Sign in").click()
-        
+
         otp_selector = 'input[id*="otp"]'
         dashboard_selector = "#content > div > div.mainAppContainerExternal"
         await page.wait_for_selector(f"{otp_selector}, {dashboard_selector}", timeout=30000)
@@ -155,7 +170,7 @@ async def perform_login_and_otp(page: Page) -> bool:
             except Exception as picker_err:
                 app_logger.warning(f"Account picker interaction issue: {picker_err}")
                 await save_screenshot(page, "account_picker_issue")
-        
+
         app_logger.info("Login process appears fully successful.")
         return True
     except Exception as e:
@@ -163,23 +178,35 @@ async def perform_login_and_otp(page: Page) -> bool:
         await save_screenshot(page, "login_critical_failure")
         return False
 
+
 async def prime_master_session(browser) -> bool:
     app_logger.info("Priming master session")
     ctx = None
     try:
-        if not browser or not browser.is_connected(): return False
+        if not browser or not browser.is_connected():
+            return False
         ctx = await browser.new_context()
         ctx.set_default_navigation_timeout(PAGE_TIMEOUT)
         ctx.set_default_timeout(ACTION_TIMEOUT)
-        await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "stylesheet", "font", "media") else route.continue_())
+        await ctx.route(
+            "**/*",
+            lambda route: (
+                route.abort()
+                if route.request.resource_type in ("image", "stylesheet", "font", "media")
+                else route.continue_()
+            ),
+        )
         page = await ctx.new_page()
-        if not await perform_login_and_otp(page): return False
+        if not await perform_login_and_otp(page):
+            return False
         storage = await ctx.storage_state()
-        with open(STORAGE_STATE, 'w') as f: json.dump(storage, f)
+        with open(STORAGE_STATE, "w") as f:
+            json.dump(storage, f)
         app_logger.info(f"Login successful. Auth state saved to '{STORAGE_STATE}'.")
         return True
     except Exception as e:
         app_logger.exception(f"Priming failed with an unexpected error: {e}")
         return False
     finally:
-        if ctx: await ctx.close()
+        if ctx:
+            await ctx.close()

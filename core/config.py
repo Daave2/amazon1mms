@@ -1,34 +1,90 @@
 import os
 import re
-import json
-import logging
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pytz import timezone
 
-# Config loading helper
-def load_config():
-    try:
-        with open('config.json', 'r') as config_file:
-            return json.load(config_file)
-    except FileNotFoundError:
-        # We will let the entrypoint handle graceful exits if config doesn't exist
-        return {}
-    except json.JSONDecodeError:
-        return {}
 
-config = load_config()
+class Settings(BaseSettings):
+    # App Settings
+    debug_mode: bool = Field(default=False, alias="DEBUG")
+    local_timezone: str = Field(default="Europe/London")
 
-LOCAL_TIMEZONE = timezone('Europe/London')
-DEBUG_MODE      = config.get('debug', False)
-LOGIN_URL       = config.get('login_url', '')
-LOGIN_EMAIL     = config.get('login_email', '')
-LOGIN_PASSWORD  = config.get('login_password', '')
-OTP_SECRET_KEY  = config.get('otp_secret_key', '')
+    # Auth & API Setup
+    login_url: str = Field(...)
+    login_email: str = Field(...)
+    login_password: str = Field(...)
+    otp_secret_key: str = Field(...)
+    base_dashboard_url: str = Field(
+        default="https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx", alias="TARGET_URL"
+    )
 
-BASE_DASHBOARD_URL = config.get('target_url', '')
-CHAT_WEBHOOK_URL = config.get('chat_webhook_url')
-CHAT_BATCH_SIZE  = config.get('chat_batch_size', 100)
+    # Integrations
+    chat_webhook_url: str = Field(default="")
+    chat_batch_size: int = Field(default=100)
 
-STORE_PREFIX_RE  = re.compile(r"^morrisons?\s*-?\s*|\s*-?\s*morrisons?$", re.I)
+    # Concurrency
+    initial_concurrency: int = Field(default=30)
+    num_form_submitters: int = Field(default=2)
+
+    # Auto Concurrency config
+    auto_enabled: bool = Field(default=True)
+    auto_min_concurrency: int = Field(default=1)
+    auto_max_concurrency: int = Field(default=40)
+    cpu_upper_threshold: int = Field(default=90)
+    cpu_lower_threshold: int = Field(default=65)
+    mem_upper_threshold: int = Field(default=90)
+    check_interval_seconds: int = Field(default=5)
+    cooldown_seconds: int = Field(default=15)
+
+    # Limits & Retries
+    page_timeout_ms: int = Field(default=30000)
+    wait_timeout_ms: int = Field(default=15000)
+    action_timeout_ms: int = Field(default=15000)
+    worker_retry_count: int = Field(default=1)
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+
+try:
+    settings = Settings()
+except Exception as e:
+    import sys
+
+    print(f"CRITICAL CONFIGURATION ERROR: {e}")
+    sys.exit(1)
+
+LOCAL_TIMEZONE = timezone(settings.local_timezone)
+DEBUG_MODE = settings.debug_mode
+
+LOGIN_URL = settings.login_url
+LOGIN_EMAIL = settings.login_email
+LOGIN_PASSWORD = settings.login_password
+OTP_SECRET_KEY = settings.otp_secret_key
+BASE_DASHBOARD_URL = settings.base_dashboard_url
+
+CHAT_WEBHOOK_URL = settings.chat_webhook_url
+CHAT_BATCH_SIZE = settings.chat_batch_size
+
+INITIAL_CONCURRENCY = settings.initial_concurrency
+NUM_FORM_SUBMITTERS = settings.num_form_submitters
+
+AUTO_ENABLED = settings.auto_enabled
+AUTO_MIN_CONCURRENCY = settings.auto_min_concurrency
+AUTO_MAX_CONCURRENCY = settings.auto_max_concurrency
+CPU_UPPER_THRESHOLD = settings.cpu_upper_threshold
+CPU_LOWER_THRESHOLD = settings.cpu_lower_threshold
+MEM_UPPER_THRESHOLD = settings.mem_upper_threshold
+CHECK_INTERVAL = settings.check_interval_seconds
+COOLDOWN_SECONDS = settings.cooldown_seconds
+
+PAGE_TIMEOUT = settings.page_timeout_ms
+WAIT_TIMEOUT = settings.wait_timeout_ms
+ACTION_TIMEOUT = settings.action_timeout_ms
+WORKER_RETRY_COUNT = settings.worker_retry_count
+
+STORE_PREFIX_RE = re.compile(r"^morrisons?\s*-?\s*|\s*-?\s*morrisons?$", re.I)
 SPECIAL_NAME_MAPPINGS = {
     "analby": "anlaby",
     "baglan moor": "baglan",
@@ -43,56 +99,44 @@ SPECIAL_NAME_MAPPINGS = {
 }
 
 # --- Constants for target-based emojis ---
-EMOJI_GREEN_CHECK = "\u2705" # ✅
-EMOJI_RED_CROSS = "\u274C"   # ❌
+EMOJI_GREEN_CHECK = "\u2705"  # ✅
+EMOJI_RED_CROSS = "\u274c"  # ❌
 UPH_THRESHOLD = 80
 LATES_THRESHOLD = 3.0
 INF_THRESHOLD = 2.0
 
-FORM_POST_URL = "https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse"
+FORM_POST_URL = (
+    "https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse"
+)
 FIELD_MAP = {
-    'date':           'entry.1483325020',
-    'store':          'entry.117918617',
-    'orders':         'entry.128719511',
-    'units':          'entry.66444552',
-    'fulfilled':      'entry.2093280675',
-    'uph':            'entry.316694141',
-    'inf':            'entry.909185879',
-    'found':          'entry.637588300',
-    'cancelled':      'entry.1775576921',
-    'lates':          'entry.2130893076',
-    'field_11':       'entry.2071609599',
-    'time_available': 'entry.1823671734',
+    "date": "entry.1483325020",
+    "store": "entry.117918617",
+    "orders": "entry.128719511",
+    "units": "entry.66444552",
+    "fulfilled": "entry.2093280675",
+    "uph": "entry.316694141",
+    "inf": "entry.909185879",
+    "found": "entry.637588300",
+    "cancelled": "entry.1775576921",
+    "lates": "entry.2130893076",
+    "field_11": "entry.2071609599",
+    "time_available": "entry.1823671734",
 }
 
-INITIAL_CONCURRENCY = config.get('initial_concurrency', 30)
-NUM_FORM_SUBMITTERS = config.get('num_form_submitters', 2)
-
-AUTO_CONF = config.get('auto_concurrency', {})
-AUTO_ENABLED = AUTO_CONF.get('enabled', False)
-AUTO_MIN_CONCURRENCY = AUTO_CONF.get('min_concurrency', config.get('min_concurrency', 1))
-AUTO_MAX_CONCURRENCY = AUTO_CONF.get('max_concurrency', config.get('max_concurrency', INITIAL_CONCURRENCY))
-CPU_UPPER_THRESHOLD = AUTO_CONF.get('cpu_upper_threshold', 90)
-CPU_LOWER_THRESHOLD = AUTO_CONF.get('cpu_lower_threshold', 65)
-MEM_UPPER_THRESHOLD = AUTO_CONF.get('mem_upper_threshold', 90)
-CHECK_INTERVAL = AUTO_CONF.get('check_interval_seconds', 5)
-COOLDOWN_SECONDS = AUTO_CONF.get('cooldown_seconds', 15)
-
-OUTPUT_DIR      = 'output'
-LOG_FILE        = os.path.join(OUTPUT_DIR, 'submissions.log')
-JSON_LOG_FILE   = os.path.join(OUTPUT_DIR, 'submissions.jsonl')
-STORAGE_STATE   = 'state.json'
-DISCOVERY_CACHE_FILE = os.path.join(OUTPUT_DIR, 'discovery_cache.json')
-
-PAGE_TIMEOUT    = config.get('page_timeout_ms', 30000)
-WAIT_TIMEOUT    = config.get('element_wait_timeout_ms', 15000)
-ACTION_TIMEOUT = int(PAGE_TIMEOUT / 2)
-WORKER_RETRY_COUNT = 1
+OUTPUT_DIR = "output"
+LOG_FILE = os.path.join(OUTPUT_DIR, "submissions.log")
+JSON_LOG_FILE = os.path.join(OUTPUT_DIR, "submissions.jsonl")
+STORAGE_STATE = "state.json"
+DISCOVERY_CACHE_FILE = os.path.join(OUTPUT_DIR, "discovery_cache.json")
 
 RESOURCE_BLOCKLIST = [
-    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
-    "adservice.google.com", "facebook.net", "fbcdn.net", "analytics.tiktok.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "adservice.google.com",
+    "facebook.net",
+    "fbcdn.net",
+    "analytics.tiktok.com",
 ]
 
-# Create output dir upon initialization
 os.makedirs(OUTPUT_DIR, exist_ok=True)

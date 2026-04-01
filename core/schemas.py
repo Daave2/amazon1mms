@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Any, Dict
+
 
 class AmazonMetrics(BaseModel):
     OrdersShopped_V2: float = 0.0
@@ -12,30 +12,31 @@ class AmazonMetrics(BaseModel):
     OrderCancellations: float = 0.0
     TimeAvailable_V2: float = 0.0
     PickTimeInSec_V2: float = 0.0
-    
+
     # Catch-all for extra variables provided by Amazon without crashing
     class Config:
-        extra = 'ignore'
+        extra = "ignore"
+
 
 class AmazonShopperRecord(BaseModel):
-    type: Optional[str] = None
-    shopperName: Optional[str] = None
-    externalId: Optional[str] = None
-    shopperProfile: Optional[str] = 'NONE'
-    
+    type: str | None = None
+    shopperName: str | None = None
+    externalId: str | None = None
+    shopperProfile: str | None = "NONE"
+
     # Metrics can either be nested under 'metrics' or occasionally flattened depending on the endpoint.
     metrics: AmazonMetrics = Field(default_factory=AmazonMetrics)
-    
+
     # Some fields appear at the root level in certain summationMetrics variants
-    LatePicksRate: Optional[float] = None
-    TimeAvailable_V2: Optional[float] = None
-    OrdersShopped_V2: Optional[float] = None
-    RequestedQuantity_V2: Optional[float] = None
-    PickedUnits_V2: Optional[float] = None
-    AverageUPH_V2: Optional[float] = None
-    ItemNotFoundRate_V2: Optional[float] = None
-    ItemFoundRate_V2: Optional[float] = None
-    OrderCancellations: Optional[float] = None
+    LatePicksRate: float | None = None
+    TimeAvailable_V2: float | None = None
+    OrdersShopped_V2: float | None = None
+    RequestedQuantity_V2: float | None = None
+    PickedUnits_V2: float | None = None
+    AverageUPH_V2: float | None = None
+    ItemNotFoundRate_V2: float | None = None
+    ItemFoundRate_V2: float | None = None
+    OrderCancellations: float | None = None
 
     class Config:
-        extra = 'ignore'
+        extra = "ignore"
