@@ -1102,6 +1102,12 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                 try:
                     # Ensure we use the detailed 'metrics' endpoint, not 'summationMetrics'
                     detail_template = api_url_template.replace('/summationMetrics?', '/metrics?')
+                    
+                    # Update only the end hour to match the current time
+                    # (Amazon uses internal non-calendar dates for the rolling window; don't change those)
+                    current_hour = datetime.now(LOCAL_TIMEZONE).hour
+                    detail_template = re.sub(r'endRange%5Bhour%5D=\d+', f'endRange%5Bhour%5D={current_hour}', detail_template)
+                    
                     target_url = detail_template.replace("{merchant_id}", merchant_id)
                     # Fast Path with Retry for 504s
                     for api_attempt in range(2):
@@ -1187,10 +1193,22 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             # api_data can be a single dict (summationMetrics) or a list of dicts (metrics)
             data_to_use = {}
             if isinstance(api_data, list):
-                app_logger.info(f"[{store_name}] Detailed metrics list received. Aggregating for store summary...")
+                app_logger.info(f"[{store_name}] Detailed metrics list received ({len(api_data)} records). Aggregating...")
                 # Aggregate from MASTER type records to avoid double counting DETAIL ones
-                masters = [m for m in api_data if m.get('type') == 'MASTER']
-                if not masters: masters = api_data # Fallback to everything
+                all_masters = [m for m in api_data if m.get('type') == 'MASTER']
+                if not all_masters: all_masters = api_data  # Fallback
+                
+                # Dedup by shopper: prefer COMBINED > REGULAR > RESCUE > MANAGER
+                # COMBINED already includes both REGULAR and RESCUE work for that shopper
+                PROFILE_PRIORITY = {'COMBINED': 0, 'REGULAR': 1, 'RESCUE': 2, 'MANAGER': 3}
+                by_shopper = {}
+                for m in all_masters:
+                    name = m.get('shopperName') or m.get('externalId', 'unknown')
+                    profile = m.get('shopperProfile') or 'NONE'
+                    if name not in by_shopper or PROFILE_PRIORITY.get(profile, 99) < PROFILE_PRIORITY.get(by_shopper[name].get('shopperProfile', 'NONE'), 99):
+                        by_shopper[name] = m
+                
+                masters = list(by_shopper.values())
 
                 total_orders = sum(float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) for m in masters)
                 total_units  = sum(float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) for m in masters)
