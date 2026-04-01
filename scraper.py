@@ -42,7 +42,7 @@ def load_default_data(state: ScraperState) -> list:
     try:
         with open("urls.csv", newline="") as f:
             reader = csv.reader(f)
-            header = next(reader)
+            next(reader)  # Skip header
             for i, row in enumerate(reader):
                 if not row:
                     continue

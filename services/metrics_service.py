@@ -297,7 +297,7 @@ async def process_single_store(
                 app_logger.info(f"[{store_name}] Retrying {store_name} on attempt {attempt + 2}...")
                 try:
                     await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                except:
+                except Exception:
                     pass
                 await asyncio.sleep(sleep_time)
             else:

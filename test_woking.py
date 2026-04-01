@@ -67,7 +67,7 @@ async def main():
         total_units = sum(float(m.get("metrics", {}).get("RequestedQuantity_V2", 0)) for m in masters)
         total_fulfilled = sum(float(m.get("metrics", {}).get("PickedUnits_V2", 0)) for m in masters)
         total_pick_time_sec = sum(float(m.get("metrics", {}).get("PickTimeInSec_V2", 0)) for m in masters)
-        total_time_ms = sum(float(m.get("metrics", {}).get("TimeAvailable_V2", 0)) for m in masters)
+        _total_time_ms = sum(float(m.get("metrics", {}).get("TimeAvailable_V2", 0)) for m in masters)
         uph = (total_fulfilled / (total_pick_time_sec / 3600)) if total_pick_time_sec > 0 else 0.0
 
         total_late = sum(
