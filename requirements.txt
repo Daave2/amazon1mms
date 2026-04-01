@@ -1,0 +1,8 @@
+# requirements.txt
+playwright
+pyotp
+psutil
+pytz
+aiohttp
+certifi
+aiofiles

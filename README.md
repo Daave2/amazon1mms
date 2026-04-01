@@ -1,0 +1,97 @@
+# Amazon Seller Central Scraper (1MMS)
+
+This repository contains an asynchronous scraper built with Playwright. It logs
+into Amazon Seller Central, collects dashboard metrics for a list of stores and
+submits them to a Google Form so they can be aggregated in Google Sheets.
+
+This is the **1MMS** (single Merchant Management System) version, which uses a
+single dashboard page with a store-selection dropdown instead of navigating to
+individual store URLs.
+
+The code may be executed locally or through the included GitHub Actions
+workflow.
+
+
+
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Local Setup](#local-setup)
+- [Running Locally](#running-locally)
+- [GitHub Actions Workflow](#github-actions-workflow)
+- [Configuration Reference](#configuration-reference)
+- [Notes](#notes)
+
+## Features
+
+- Collects metrics for multiple stores listed in `urls.csv`
+- Uses a single dashboard page with store-selection dropdown (1MMS approach)
+- Posts metrics to a configurable Google Form (12 fields)
+- Supports configurable concurrency and automatic adjustments based on system load
+- Produces structured logs in `output/` and rotates `app.log`
+- Optionally posts progress to Google Chat using collapsible cards grouped by timestamped batches. 
+- Chat messages are tagged with **(1MMS)** for easy identification
+- **Enhanced Job Summary**: Sends a detailed post-run report to Google Chat including:
+  - High-level stats (Throughput, Success Rate, Duration)
+  - Business Volume (Total Orders, Units)
+  - Resilience Metrics (Retries, Stores Retried)
+  - Speed Breakdown (Avg Collection Time, p95 Latency, Bottleneck Analysis)
+  - Failure Analysis (Breakdown by error type and list of failed stores)
+
+## Requirements
+
+- Python 3.11
+- Playwright with Chromium browsers
+- See `requirements.txt` for the full list of Python packages
+
+## Local Setup
+
+1. Install Python dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   python -m playwright install chromium
+   ```
+
+2. Copy the example configuration and edit it with your credentials:
+
+   ```bash
+   cp config.example.json config.json
+   # then edit config.json
+   ```
+
+   Important fields include your Seller Central login details, the target Google Form URL, and concurrency settings. The example file contains all available keys.
+
+3. Populate `urls.csv` with the stores you want to scrape. Each row uses the following columns:
+   `merchant_id,new_id,store_name,marketplace_id`.
+
+## Running Locally
+
+Execute the scraper from the command line:
+
+```bash
+python scraper.py
+```
+
+Logs and submission data will be saved under the `output/` directory.
+
+## GitHub Actions Workflow
+
+The workflow defined in `.github/workflows/run-scraper.yml` installs dependencies,
+creates a `config.json` from repository secrets and runs the scraper on a
+schedule. It checks the current UK time against `UK_TARGET_HOURS` to decide
+whether to proceed with a run.
+
+Artifacts such as logs are uploaded for each run and kept for seven days.
+
+## Configuration Reference
+
+Key options from `config.example.json`:
+
+See the example file for full details.
+
+## Notes
+
+The repository excludes `config.json`, `state.json`, and `output/` from version control. These files may contain sensitive information or large log data. Ensure you keep your credentials secure.
+Timestamps recorded by the scraper default to the Europe/London timezone. Modify the `LOCAL_TIMEZONE` constant in `scraper.py` if you prefer a different local time.
