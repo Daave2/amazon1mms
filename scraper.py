@@ -1186,27 +1186,37 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             data_to_use = {}
             if isinstance(api_data, list):
                 app_logger.info(f"[{store_name}] Detailed metrics list received. Aggregating for store summary...")
-                # Aggregate from MASTER type records to avoid double counting DETAIL ones
+                # Aggregate from MASTER type records to avoid double counting
                 masters = [m for m in api_data if m.get('type') == 'MASTER']
-                if not masters: masters = api_data # Fallback to everything
-
-                total_orders = sum(float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) for m in masters)
-                total_units  = sum(float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) for m in masters)
-                total_fulfilled = sum(float(m.get('metrics', {}).get('PickedUnits_V2', 0)) for m in masters)
-                total_cancellations = sum(float(m.get('metrics', {}).get('OrderCancellations', 0)) for m in masters)
+                if not masters: masters = api_data # Fallback
                 
-                # Weighted UPH calculation
-                total_time_ms = sum(float(m.get('metrics', {}).get('TimeAvailable_V2', 0)) for m in masters)
-                uph = (total_units / (total_time_ms / 3600000)) if total_time_ms > 0 else 0.0
+                # Helper to get metric regardless of casing or nesting
+                def get_m(obj, key):
+                    metrics = obj.get('metrics', {})
+                    # Try PascalCase, then camelCase
+                    return (float(metrics.get(key, 0)) or 
+                            float(metrics.get(key[0].lower() + key[1:], 0)) or
+                            float(obj.get(key, 0)))
 
+                total_orders = sum(get_m(m, 'OrdersShopped_V2') for m in masters)
+                total_units  = sum(get_m(m, 'RequestedQuantity_V2') for m in masters)
+                total_fulfilled = sum(get_m(m, 'PickedUnits_V2') for m in masters)
+                total_cancellations = sum(get_m(m, 'OrderCancellations') for m in masters)
+                
                 # Weighted Late Picks calculation (matching dashboard "Late Picks")
+                # We use LatePicksRate as the primary source for the dashboard "Late Picks" column
                 total_late_picks_count = sum(
-                    float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) * (float(m.get('metrics', {}).get('LatePicksRate', 0)) / 100)
+                    get_m(m, 'OrdersShopped_V2') * (get_m(m, 'LatePicksRate') / 100)
                     for m in masters
                 )
                 late_picks_rate = (total_late_picks_count / total_orders * 100) if total_orders > 0 else 0.0
                 
+                # Weighted UPH calculation
+                total_time_ms = sum(get_m(m, 'TimeAvailable_V2') for m in masters)
+                uph = (total_units / (total_time_ms / 3600000)) if total_time_ms > 0 else 0.0
+
                 data_to_use = {
+                    'TasksCompleted': total_orders, # Fallback name
                     'OrdersShopped_V2': total_orders,
                     'RequestedQuantity_V2': total_units,
                     'PickedUnits_V2': total_fulfilled,
@@ -1218,12 +1228,23 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             else:
                 data_to_use = api_data
 
-            # Prioritize LatePicksRate from JSON
-            lates_val = data_to_use.get('LatePicksRate', data_to_use.get('metrics', {}).get('LatePicksRate', 0.0))
-            formatted_lates = f"{lates_val:.1f} %"
+            # --- Extract Final Stats with strict dashboard parity ---
+            # Try specific dashboard labels first, then pascal, then camel
+            lates_val = (data_to_use.get('LatePicksRate') or 
+                         data_to_use.get('latePicksRate') or 
+                         data_to_use.get('metrics', {}).get('LatePicksRate', 0.0))
             
-            cancellations_val = data_to_use.get('OrderCancellations', data_to_use.get('metrics', {}).get('OrderCancellations', 0))
-            app_logger.info(f"[{store_name}] Metrics extracted: Lates={formatted_lates}, Cancellations={cancellations_val}")
+            # Tasks Completed optimization
+            tasks_val = (data_to_use.get('TasksCompleted') or 
+                         data_to_use.get('tasksCompleted') or 
+                         data_to_use.get('OrdersShopped_V2') or 
+                         data_to_use.get('metrics', {}).get('OrdersShopped_V2', 0))
+            
+            cancellations_val = (data_to_use.get('OrderCancellations') or 
+                                 data_to_use.get('metrics', {}).get('OrderCancellations', 0))
+            
+            formatted_lates = f"{float(lates_val):.1f} %"
+            app_logger.info(f"[{store_name}] Dashboard extraction: Tasks={tasks_val}, Lates={formatted_lates}, Skip={cancellations_val}")
 
             # --- Compute Time Available from API ---
             milliseconds_from_api = float(data_to_use.get('TimeAvailable_V2', 0.0))
