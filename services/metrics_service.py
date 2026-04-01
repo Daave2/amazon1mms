@@ -157,42 +157,49 @@ async def process_single_store(page: Page, store_info: Dict[str,str], submission
             data_to_use = {}
             if isinstance(api_data, list):
                 app_logger.info(f"[{store_name}] Detailed metrics list received ({len(api_data)} records). Aggregating...")
-                all_masters = [m for m in api_data if m.get('type') == 'MASTER']
-                if not all_masters: all_masters = api_data
+                from core.schemas import AmazonShopperRecord
+                
+                # Parse robustly using Pydantic
+                records = [AmazonShopperRecord.model_validate(m) for m in api_data]
+                
+                all_masters = [m for m in records if m.type == 'MASTER']
+                if not all_masters: all_masters = records
                 
                 PROFILE_PRIORITY = {'COMBINED': 0, 'REGULAR': 1, 'RESCUE': 2, 'MANAGER': 3}
                 by_shopper = {}
                 for m in all_masters:
-                    name = m.get('shopperName') or m.get('externalId', 'unknown')
-                    profile = m.get('shopperProfile') or 'NONE'
-                    if name not in by_shopper or PROFILE_PRIORITY.get(profile, 99) < PROFILE_PRIORITY.get(by_shopper[name].get('shopperProfile', 'NONE'), 99):
+                    name = m.shopperName or m.externalId or 'unknown'
+                    profile = m.shopperProfile or 'NONE'
+                    existing_profile = by_shopper[name].shopperProfile if name in by_shopper else 'NONE'
+                    if name not in by_shopper or PROFILE_PRIORITY.get(profile, 99) < PROFILE_PRIORITY.get(existing_profile, 99):
                         by_shopper[name] = m
                 
                 masters = list(by_shopper.values())
 
-                total_orders = sum(float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) for m in masters)
-                total_units  = sum(float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) for m in masters)
-                total_fulfilled = sum(float(m.get('metrics', {}).get('PickedUnits_V2', 0)) for m in masters)
+                total_orders = sum(m.metrics.OrdersShopped_V2 for m in masters)
+                total_units  = sum(m.metrics.RequestedQuantity_V2 for m in masters)
+                total_fulfilled = sum(m.metrics.PickedUnits_V2 for m in masters)
                 
-                total_pick_time_sec = sum(float(m.get('metrics', {}).get('PickTimeInSec_V2', 0)) for m in masters)
-                total_time_ms = sum(float(m.get('metrics', {}).get('TimeAvailable_V2', 0)) for m in masters)
+                total_pick_time_sec = sum(m.metrics.PickTimeInSec_V2 for m in masters)
+                total_time_ms = sum(m.metrics.TimeAvailable_V2 for m in masters)
                 uph = (total_fulfilled / (total_pick_time_sec / 3600)) if total_pick_time_sec > 0 else 0.0
 
                 total_late_picks_count = sum(
-                    float(m.get('metrics', {}).get('OrdersShopped_V2', 0)) * (float(m.get('metrics', {}).get('LatePicksRate', 0)) / 100)
+                    m.metrics.OrdersShopped_V2 * (m.metrics.LatePicksRate / 100)
                     for m in masters
                 )
                 late_picks_rate = (total_late_picks_count / total_orders * 100) if total_orders > 0 else 0.0
 
                 total_inf_count = sum(
-                    float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) * (float(m.get('metrics', {}).get('ItemNotFoundRate_V2', 0)) / 100)
+                    m.metrics.RequestedQuantity_V2 * (m.metrics.ItemNotFoundRate_V2 / 100)
                     for m in masters
                 )
                 inf_rate = (total_inf_count / total_units * 100) if total_units > 0 else 0.0
                 found_rate = 100.0 - inf_rate
 
-                total_cancellations = sum(float(m.get('metrics', {}).get('OrderCancellations', 0)) for m in masters)
+                total_cancellations = sum(m.metrics.OrderCancellations for m in masters)
                 
+                # Assign flattened values mapped for final submission
                 data_to_use = {
                     'OrdersShopped_V2': total_orders,
                     'RequestedQuantity_V2': total_units,
@@ -205,9 +212,21 @@ async def process_single_store(page: Page, store_info: Dict[str,str], submission
                     'TimeAvailable_V2': total_time_ms
                 }
             else:
-                data_to_use = api_data
+                from core.schemas import AmazonShopperRecord
+                record = AmazonShopperRecord.model_validate(api_data)
+                data_to_use = {
+                    'OrdersShopped_V2': record.OrdersShopped_V2 or record.metrics.OrdersShopped_V2,
+                    'RequestedQuantity_V2': record.RequestedQuantity_V2 or record.metrics.RequestedQuantity_V2,
+                    'PickedUnits_V2': record.PickedUnits_V2 or record.metrics.PickedUnits_V2,
+                    'AverageUPH_V2': record.AverageUPH_V2 or record.metrics.AverageUPH_V2,
+                    'LatePicksRate': record.LatePicksRate or record.metrics.LatePicksRate,
+                    'ItemNotFoundRate_V2': record.ItemNotFoundRate_V2 or record.metrics.ItemNotFoundRate_V2,
+                    'ItemFoundRate_V2': record.ItemFoundRate_V2 or record.metrics.ItemFoundRate_V2,
+                    'OrderCancellations': record.OrderCancellations or record.metrics.OrderCancellations,
+                    'TimeAvailable_V2': record.TimeAvailable_V2 or record.metrics.TimeAvailable_V2,
+                }
 
-            lates_val = data_to_use.get('LatePicksRate', data_to_use.get('metrics', {}).get('LatePicksRate', 0.0))
+            lates_val = data_to_use.get('LatePicksRate', 0.0)
             formatted_lates = f"{lates_val:.1f} %"
             app_logger.info(f"[{store_name}] 'Late Picks' extracted from API JSON: {formatted_lates}")
 
