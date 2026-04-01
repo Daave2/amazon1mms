@@ -1100,7 +1100,9 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             # --- STRATEGY: Try FAST PATH (Direct API) if we have the template and ID ---
             if api_url_template and merchant_id:
                 try:
-                    target_url = api_url_template.replace("{merchant_id}", merchant_id)
+                    # Ensure we use the detailed 'metrics' endpoint, not 'summationMetrics'
+                    detail_template = api_url_template.replace('/summationMetrics?', '/metrics?')
+                    target_url = detail_template.replace("{merchant_id}", merchant_id)
                     # Fast Path with Retry for 504s
                     for api_attempt in range(2):
                         resp = await page.context.request.get(target_url, timeout=METRICS_TIMEOUT)
@@ -1152,7 +1154,7 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                 params = urllib.parse.parse_qs(parsed.query)
                 
                 # Capture the template for FAST PATH. We prefer keeping it generic with {merchant_id}
-                if "summationMetrics" in req_url and not api_url_template:
+                if ("summationMetrics" in req_url or "api/metrics" in req_url) and not api_url_template:
                     async with api_discovery_lock:
                         # Replace the specific merchant ID with a placeholder
                         generic_url = re.sub(r'merchantIds%5B%5D=[^&]*', "merchantIds%5B%5D={merchant_id}", req_url)
@@ -1204,6 +1206,17 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                     for m in masters
                 )
                 late_picks_rate = (total_late_picks_count / total_orders * 100) if total_orders > 0 else 0.0
+
+                # Weighted INF calculation
+                total_inf_count = sum(
+                    float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) * (float(m.get('metrics', {}).get('ItemNotFoundRate_V2', 0)) / 100)
+                    for m in masters
+                )
+                inf_rate = (total_inf_count / total_units * 100) if total_units > 0 else 0.0
+                found_rate = 100.0 - inf_rate
+
+                # Total order cancellations
+                total_cancellations = sum(float(m.get('metrics', {}).get('OrderCancellations', 0)) for m in masters)
                 
                 data_to_use = {
                     'OrdersShopped_V2': total_orders,
@@ -1211,6 +1224,9 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                     'PickedUnits_V2': total_fulfilled,
                     'AverageUPH_V2': uph,
                     'LatePicksRate': late_picks_rate,
+                    'ItemNotFoundRate_V2': inf_rate,
+                    'ItemFoundRate_V2': found_rate,
+                    'OrderCancellations': total_cancellations,
                     'TimeAvailable_V2': total_time_ms
                 }
             else:
@@ -1238,7 +1254,7 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                 'uph': f"{(data_to_use.get('AverageUPH_V2') or 0.0):.0f}",
                 'inf': f"{(data_to_use.get('ItemNotFoundRate_V2') or 0.0):.1f} %",
                 'found': f"{(data_to_use.get('ItemFoundRate_V2') or 0.0):.1f} %",
-                'cancelled': str(data_to_use.get('ShortedUnits_V2') or data_to_use.get('OrderCancellations') or 0),
+                'cancelled': str(int(data_to_use.get('OrderCancellations') or 0)),
                 'lates': formatted_lates,
                 'time_available': formatted_time_available,
             }
