@@ -104,11 +104,11 @@ jobs:
         LOGIN_PASSWORD:  ${{ secrets.LOGIN_PASSWORD }}
         OTP_SECRET_KEY:  ${{ secrets.OTP_SECRET_KEY }}
         CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
-        MARKETPLACE_ID:  ${{ secrets.MARKETPLACE_ID || 'ACZ4M364GT4NEK' }}
-        TARGET_URL:      ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
-        MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || '40' }}
-        INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || '25' }}
-        NUM_SUBMITTERS:  ${{ secrets.NUM_SUBMITTERS || '5' }}
+        MARKETPLACE_ID:  ${{ secrets.MARKETPLACE_ID }}
+        TARGET_URL:      ${{ secrets.TARGET_URL }}
+        MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY }}
+        INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY }}
+        NUM_SUBMITTERS:  ${{ secrets.NUM_SUBMITTERS }}
       run: |
         cat > config.json <<JSON
         {
@@ -120,17 +120,17 @@ jobs:
           "login_password":  "${LOGIN_PASSWORD}",
           "otp_secret_key":  "${OTP_SECRET_KEY}",
           "chat_webhook_url": "${CHAT_WEBHOOK_URL}",
-          "marketplace_id":  "${MARKETPLACE_ID}",
-          "target_url":      "${TARGET_URL}",
-          "max_concurrency": ${MAX_CONCURRENCY},
-          "initial_concurrency": ${INITIAL_CONCURRENCY},
-          "num_form_submitters": ${NUM_SUBMITTERS},
+          "marketplace_id":  "${MARKETPLACE_ID:-ACZ4M364GT4NEK}",
+          "target_url":      "${TARGET_URL:-https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx}",
+          "max_concurrency": ${MAX_CONCURRENCY:-40},
+          "initial_concurrency": ${INITIAL_CONCURRENCY:-25},
+          "num_form_submitters": ${NUM_SUBMITTERS:-5},
           "page_timeout_ms": 30000,
           "element_wait_timeout_ms": 15000,
           "auto_concurrency": {
             "enabled": true,
             "min_concurrency": 1,
-            "max_concurrency": ${MAX_CONCURRENCY}
+            "max_concurrency": ${MAX_CONCURRENCY:-40}
           },
           "schedule_times": ["10:00", "16:00", "19:00"]
         }
