@@ -1214,9 +1214,10 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
                 total_units  = sum(float(m.get('metrics', {}).get('RequestedQuantity_V2', 0)) for m in masters)
                 total_fulfilled = sum(float(m.get('metrics', {}).get('PickedUnits_V2', 0)) for m in masters)
                 
-                # Weighted UPH calculation
+                # UPH = Picked Units / Pick Time (in hours) — actual picking time, not available time
+                total_pick_time_sec = sum(float(m.get('metrics', {}).get('PickTimeInSec_V2', 0)) for m in masters)
                 total_time_ms = sum(float(m.get('metrics', {}).get('TimeAvailable_V2', 0)) for m in masters)
-                uph = (total_units / (total_time_ms / 3600000)) if total_time_ms > 0 else 0.0
+                uph = (total_fulfilled / (total_pick_time_sec / 3600)) if total_pick_time_sec > 0 else 0.0
 
                 # Weighted Late Picks calculation (LatePicksRate, NOT UnacceptedRate_V2)
                 total_late_picks_count = sum(
