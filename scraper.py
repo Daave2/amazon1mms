@@ -1101,13 +1101,19 @@ async def process_single_store(page: Page, store_info: Dict[str,str], queue: Que
             if api_url_template and merchant_id:
                 try:
                     target_url = api_url_template.replace("{merchant_id}", merchant_id)
-                    app_logger.info(f"[{store_name}] FAST PATH: Executing direct context API fetch...")
-                    resp = await page.context.request.get(target_url)
-                    if resp.status == 200:
-                        api_data = await resp.json()
-                        app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
-                    else:
-                        raise Exception(f"API Fetch failed: {resp.status}")
+                    # Fast Path with Retry for 504s
+                    for api_attempt in range(2):
+                        resp = await page.context.request.get(target_url, timeout=METRICS_TIMEOUT)
+                        if resp.status == 200:
+                            api_data = await resp.json()
+                            app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
+                            break
+                        elif resp.status == 504 and api_attempt == 0:
+                            app_logger.warning(f"[{store_name}] API returned 504. Retrying in 2s...")
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            raise Exception(f"API Fetch failed: {resp.status}")
                 except Exception as api_err:
                     app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Falling back to UI.")
                     api_data = None
