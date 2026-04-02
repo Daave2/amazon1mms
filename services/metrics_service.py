@@ -14,6 +14,7 @@ from core.config import (
     WORKER_RETRY_COUNT,
 )
 from core.logger import app_logger
+from core.metrics import build_form_data, normalize_metrics_payload
 from core.state import ScraperState
 from core.utils import normalize_name, save_screenshot
 
@@ -92,7 +93,7 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
 async def process_single_store(
     page: Page, store_info: dict[str, str], submission_queue: asyncio.Queue, state: ScraperState
 ):
-    start_ts = asyncio.get_event_loop().time()
+    start_ts = asyncio.get_running_loop().time()
     store_name = store_info["store_name"]
     formatted_name = normalize_name(store_name)
     dropdown_name = formatted_name
@@ -106,9 +107,11 @@ async def process_single_store(
     METRICS_TIMEOUT = 45_000
 
     for attempt in range(WORKER_RETRY_COUNT):
+        current_stage = "general"
         try:
             api_data = None
             if state.cache.api_url_template and merchant_id:
+                current_stage = "api_fast_path"
                 try:
                     detail_template = state.cache.api_url_template.replace("/summationMetrics?", "/metrics?")
                     current_hour = datetime.now(LOCAL_TIMEZONE).hour
@@ -131,9 +134,15 @@ async def process_single_store(
                             raise Exception(f"API Fetch failed: {resp.status}")
                 except Exception as api_err:
                     app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Falling back to UI.")
+                    await state.record_issue(
+                        f"{store_name} (API Fast Path Fallback)",
+                        asyncio.get_running_loop().time(),
+                        category="api_fast_path",
+                    )
                     api_data = None
 
             if not api_data:
+                current_stage = "ui_fallback"
                 dropdown_trigger = page.locator("#store-selector-dropdown")
                 if not page.url.startswith(BASE_DASHBOARD_URL) or not await dropdown_trigger.is_visible():
                     app_logger.info(f"[{store_name}] Dashboard trigger not visible or URL is wrong. Navigating...")
@@ -176,109 +185,13 @@ async def process_single_store(
 
                     await state.cache.save()
 
-            data_to_use = {}
-            if isinstance(api_data, list):
-                app_logger.info(
-                    f"[{store_name}] Detailed metrics list received ({len(api_data)} records). Aggregating..."
-                )
-                from core.schemas import AmazonShopperRecord
-
-                # Parse robustly using Pydantic
-                records = [AmazonShopperRecord.model_validate(m) for m in api_data]
-
-                all_masters = [m for m in records if m.type == "MASTER"]
-                if not all_masters:
-                    all_masters = records
-
-                PROFILE_PRIORITY = {"COMBINED": 0, "REGULAR": 1, "RESCUE": 2, "MANAGER": 3}
-                by_shopper = {}
-                for m in all_masters:
-                    name = m.shopperName or m.externalId or "unknown"
-                    profile = m.shopperProfile or "NONE"
-                    existing_profile = by_shopper[name].shopperProfile if name in by_shopper else "NONE"
-                    if name not in by_shopper or PROFILE_PRIORITY.get(profile, 99) < PROFILE_PRIORITY.get(
-                        existing_profile, 99
-                    ):
-                        by_shopper[name] = m
-
-                masters = list(by_shopper.values())
-
-                total_orders = sum(m.metrics.OrdersShopped_V2 for m in masters)
-                total_units = sum(m.metrics.RequestedQuantity_V2 for m in masters)
-                total_fulfilled = sum(m.metrics.PickedUnits_V2 for m in masters)
-
-                total_pick_time_sec = sum(m.metrics.PickTimeInSec_V2 for m in masters)
-                total_time_ms = sum(m.metrics.TimeAvailable_V2 for m in masters)
-                uph = (total_fulfilled / (total_pick_time_sec / 3600)) if total_pick_time_sec > 0 else 0.0
-
-                total_late_picks_count = sum(
-                    m.metrics.OrdersShopped_V2 * (m.metrics.LatePicksRate / 100) for m in masters
-                )
-                late_picks_rate = (total_late_picks_count / total_orders * 100) if total_orders > 0 else 0.0
-
-                total_inf_count = sum(
-                    m.metrics.RequestedQuantity_V2 * (m.metrics.ItemNotFoundRate_V2 / 100) for m in masters
-                )
-                inf_rate = (total_inf_count / total_units * 100) if total_units > 0 else 0.0
-                found_rate = 100.0 - inf_rate
-
-                total_cancellations = sum(m.metrics.OrderCancellations for m in masters)
-
-                # Assign flattened values mapped for final submission
-                data_to_use = {
-                    "OrdersShopped_V2": total_orders,
-                    "RequestedQuantity_V2": total_units,
-                    "PickedUnits_V2": total_fulfilled,
-                    "AverageUPH_V2": uph,
-                    "LatePicksRate": late_picks_rate,
-                    "ItemNotFoundRate_V2": inf_rate,
-                    "ItemFoundRate_V2": found_rate,
-                    "OrderCancellations": total_cancellations,
-                    "TimeAvailable_V2": total_time_ms,
-                }
-            else:
-                from core.schemas import AmazonShopperRecord
-
-                record = AmazonShopperRecord.model_validate(api_data)
-                data_to_use = {
-                    "OrdersShopped_V2": record.OrdersShopped_V2 or record.metrics.OrdersShopped_V2,
-                    "RequestedQuantity_V2": record.RequestedQuantity_V2 or record.metrics.RequestedQuantity_V2,
-                    "PickedUnits_V2": record.PickedUnits_V2 or record.metrics.PickedUnits_V2,
-                    "AverageUPH_V2": record.AverageUPH_V2 or record.metrics.AverageUPH_V2,
-                    "LatePicksRate": record.LatePicksRate or record.metrics.LatePicksRate,
-                    "ItemNotFoundRate_V2": record.ItemNotFoundRate_V2 or record.metrics.ItemNotFoundRate_V2,
-                    "ItemFoundRate_V2": record.ItemFoundRate_V2 or record.metrics.ItemFoundRate_V2,
-                    "OrderCancellations": record.OrderCancellations or record.metrics.OrderCancellations,
-                    "TimeAvailable_V2": record.TimeAvailable_V2 or record.metrics.TimeAvailable_V2,
-                }
-
-            lates_val = data_to_use.get("LatePicksRate", 0.0)
-            formatted_lates = f"{lates_val:.1f} %"
-            app_logger.info(f"[{store_name}] 'Late Picks' extracted from API JSON: {formatted_lates}")
-
-            milliseconds_from_api = float(data_to_use.get("TimeAvailable_V2", 0.0))
-            total_seconds = int(milliseconds_from_api / 1000)
-            total_minutes, _ = divmod(abs(total_seconds), 60)
-            total_hours, remaining_minutes = divmod(total_minutes, 60)
-            formatted_time_available = f"{total_hours}:{remaining_minutes:02d}"
-
-            current_date = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
-            form_data = {
-                "date": current_date,
-                "store": store_name,
-                "orders": str(data_to_use.get("OrdersShopped_V2") or 0),
-                "units": str(data_to_use.get("RequestedQuantity_V2") or 0),
-                "fulfilled": str(data_to_use.get("PickedUnits_V2") or 0),
-                "uph": f"{(data_to_use.get('AverageUPH_V2') or 0.0):.0f}",
-                "inf": f"{(data_to_use.get('ItemNotFoundRate_V2') or 0.0):.1f} %",
-                "found": f"{(data_to_use.get('ItemFoundRate_V2') or 0.0):.1f} %",
-                "cancelled": str(int(data_to_use.get("OrderCancellations") or 0)),
-                "lates": formatted_lates,
-                "time_available": formatted_time_available,
-            }
+            current_stage = "general"
+            data_to_use = normalize_metrics_payload(api_data)
+            form_data = build_form_data(store_name, data_to_use)
+            app_logger.info(f"[{store_name}] 'Late Picks' extracted from API JSON: {form_data['lates']}")
             await submission_queue.put(form_data)
 
-            duration = asyncio.get_event_loop().time() - start_ts
+            duration = asyncio.get_running_loop().time() - start_ts
             await state.record_metric(
                 store_name,
                 duration,
@@ -301,5 +214,14 @@ async def process_single_store(
                     pass
                 await asyncio.sleep(sleep_time)
             else:
-                await state.add_failure(f"{store_name} (Fail)", asyncio.get_event_loop().time())
+                failure_reason_by_stage = {
+                    "api_fast_path": "API Fast Path Failure",
+                    "ui_fallback": "UI Fallback Failure",
+                    "general": "Store Processing Failure",
+                }
+                await state.add_failure(
+                    f"{store_name} ({failure_reason_by_stage.get(current_stage, 'Store Processing Failure')})",
+                    asyncio.get_running_loop().time(),
+                    category=current_stage,
+                )
                 await save_screenshot(page, f"process_fail_{store_name}")

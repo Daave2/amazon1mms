@@ -1,6 +1,8 @@
+import asyncio
 import re
 
 from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, STORE_PREFIX_RE
+from core.logger import app_logger
 
 
 def normalize_name(name: str) -> str:
@@ -34,7 +36,6 @@ async def save_screenshot(page, prefix: str):
     from datetime import datetime
 
     from core.config import LOCAL_TIMEZONE, OUTPUT_DIR
-    from core.logger import app_logger
 
     if not page or page.is_closed():
         app_logger.warning(f"Cannot save screenshot '{prefix}': Page is closed or unavailable.")
@@ -47,3 +48,35 @@ async def save_screenshot(page, prefix: str):
         app_logger.info(f"Screenshot saved for debugging: {path}")
     except Exception as e:
         app_logger.error(f"Failed to save screenshot with prefix '{prefix}': {e}")
+
+
+async def safe_close(resource, label: str, failure_recorder=None):
+    if resource is None:
+        return
+
+    try:
+        is_closed = getattr(resource, "is_closed", None)
+        if callable(is_closed):
+            try:
+                if is_closed():
+                    return
+            except Exception:
+                pass
+
+        is_connected = getattr(resource, "is_connected", None)
+        if callable(is_connected):
+            try:
+                if not is_connected():
+                    return
+            except Exception:
+                pass
+
+        await resource.close()
+    except Exception as exc:
+        app_logger.warning(f"Failed to close {label}: {exc}")
+        if failure_recorder:
+            await failure_recorder(
+                f"{label} (Cleanup failure)",
+                asyncio.get_running_loop().time(),
+                category="cleanup",
+            )

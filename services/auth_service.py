@@ -17,7 +17,7 @@ from core.config import (
     STORAGE_STATE,
 )
 from core.logger import app_logger
-from core.utils import save_screenshot
+from core.utils import safe_close, save_screenshot
 
 
 async def check_if_login_needed(page: Page, test_url: str) -> bool:
@@ -208,5 +208,4 @@ async def prime_master_session(browser) -> bool:
         app_logger.exception(f"Priming failed with an unexpected error: {e}")
         return False
     finally:
-        if ctx:
-            await ctx.close()
+        await safe_close(ctx, "Master session context")

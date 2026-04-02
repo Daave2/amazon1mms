@@ -4,13 +4,13 @@ import io
 import json
 import os
 import ssl
-from datetime import datetime
 
 import aiofiles
 import aiohttp
 import certifi
 
-from core.config import DEBUG_MODE, FIELD_MAP, FORM_POST_URL, JSON_LOG_FILE, LOCAL_TIMEZONE, LOG_FILE
+from core.config import DEBUG_MODE, FIELD_MAP, FORM_POST_URL, JSON_LOG_FILE, LOG_FILE
+from core.forms import LOG_FIELDNAMES, build_form_payload, build_submission_log_entry
 from core.logger import app_logger
 from core.state import ScraperState
 from services.chat_service import add_to_pending_chat
@@ -21,27 +21,11 @@ log_lock = asyncio.Lock()
 
 async def log_submission(data: dict[str, str], state: ScraperState):
     async with log_lock:
-        current_timestamp = datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = {"timestamp": current_timestamp, **data}
-        fieldnames = [
-            "timestamp",
-            "date",
-            "store",
-            "orders",
-            "units",
-            "fulfilled",
-            "uph",
-            "inf",
-            "found",
-            "cancelled",
-            "lates",
-            "field_11",
-            "time_available",
-        ]
+        log_entry = build_submission_log_entry(data)
         new_csv = not os.path.exists(LOG_FILE)
         try:
             csv_buffer = io.StringIO()
-            writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames, extrasaction="ignore")
+            writer = csv.DictWriter(csv_buffer, fieldnames=LOG_FIELDNAMES, extrasaction="ignore")
             if new_csv:
                 writer.writeheader()
             writer.writerow(log_entry)
@@ -71,19 +55,16 @@ async def http_form_submitter_worker(queue: asyncio.Queue, worker_id: int, state
                 form_data = await queue.get()
                 store_name = form_data.get("store", "Unknown")
 
-                payload = {}
-                for key, value in form_data.items():
-                    if key in FIELD_MAP:
-                        payload[FIELD_MAP[key]] = value
+                payload = build_form_payload(form_data, FIELD_MAP)
 
-                submit_start = asyncio.get_event_loop().time()
+                submit_start = asyncio.get_running_loop().time()
                 async with session.post(FORM_POST_URL, data=payload, timeout=10) as resp:
                     if resp.status == 200:
                         await log_submission(form_data, state)
                         app_logger.info(f"{log_prefix} Submitted data for {store_name}")
                         await state.increment_progress()
 
-                        submit_duration = asyncio.get_event_loop().time() - submit_start
+                        submit_duration = asyncio.get_running_loop().time() - submit_start
                         await state.record_submission_time(store_name, submit_duration)
                     else:
                         error_text = await resp.text()
@@ -91,14 +72,20 @@ async def http_form_submitter_worker(queue: asyncio.Queue, worker_id: int, state
                             f"{log_prefix} Submission for {store_name} failed. Status: {resp.status}. Response: {error_text[:200]}"
                         )
                         await state.add_failure(
-                            f"{store_name} (HTTP Submit Fail {resp.status})", asyncio.get_event_loop().time()
+                            f"{store_name} (HTTP Submit Fail {resp.status})",
+                            asyncio.get_running_loop().time(),
+                            category="submission",
                         )
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 failed_store = form_data.get("store", "Unknown") if form_data else "Unknown"
                 app_logger.error(f"{log_prefix} Unhandled exception for {failed_store}: {e}", exc_info=DEBUG_MODE)
-                await state.add_failure(f"{failed_store} (Submit Exception)", asyncio.get_event_loop().time())
+                await state.add_failure(
+                    f"{failed_store} (Submit Exception)",
+                    asyncio.get_running_loop().time(),
+                    category="submission",
+                )
             finally:
                 if form_data:
                     queue.task_done()

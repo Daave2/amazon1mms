@@ -1,7 +1,9 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AmazonMetrics(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     OrdersShopped_V2: float = 0.0
     RequestedQuantity_V2: float = 0.0
     PickedUnits_V2: float = 0.0
@@ -13,12 +15,10 @@ class AmazonMetrics(BaseModel):
     TimeAvailable_V2: float = 0.0
     PickTimeInSec_V2: float = 0.0
 
-    # Catch-all for extra variables provided by Amazon without crashing
-    class Config:
-        extra = "ignore"
-
 
 class AmazonShopperRecord(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     type: str | None = None
     shopperName: str | None = None
     externalId: str | None = None
@@ -37,6 +37,3 @@ class AmazonShopperRecord(BaseModel):
     ItemNotFoundRate_V2: float | None = None
     ItemFoundRate_V2: float | None = None
     OrderCancellations: float | None = None
-
-    class Config:
-        extra = "ignore"

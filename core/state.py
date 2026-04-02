@@ -72,6 +72,7 @@ class ScraperState:
         self.progress_lock = asyncio.Lock()
 
         self.run_failures = []
+        self.failure_events: list[dict[str, object]] = []
         self.failure_timestamps = []
         self.failure_lock = asyncio.Lock()
 
@@ -107,10 +108,15 @@ class ScraperState:
             self.progress["current"] += 1
             self.progress["lastUpdate"] = datetime.now(LOCAL_TIMEZONE).strftime("%H:%M:%S")
 
-    async def add_failure(self, failure_msg: str, timestamp: float):
+    async def record_issue(self, failure_msg: str, timestamp: float, category: str = "general"):
+        async with self.failure_lock:
+            self.failure_events.append({"message": failure_msg, "category": category, "terminal": False})
+
+    async def add_failure(self, failure_msg: str, timestamp: float, category: str = "general"):
         async with self.failure_lock:
             self.run_failures.append(failure_msg)
             self.failure_timestamps.append(timestamp)
+            self.failure_events.append({"message": failure_msg, "category": category, "terminal": True})
 
     async def record_metric(self, store_name: str, duration: float, orders: int, units: int):
         async with self.metrics_lock:

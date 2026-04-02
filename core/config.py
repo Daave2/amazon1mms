@@ -22,7 +22,11 @@ class Settings(BaseSettings):
 
     # Integrations
     chat_webhook_url: str = Field(default="")
-    chat_batch_size: int = Field(default=100)
+    chat_batch_size: int = Field(default=100, alias="CHAT_BATCH_SIZE")
+    form_post_url: str = Field(
+        default="https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse",
+        alias="FORM_POST_URL",
+    )
 
     # Concurrency
     initial_concurrency: int = Field(default=30)
@@ -66,6 +70,7 @@ BASE_DASHBOARD_URL = settings.base_dashboard_url
 
 CHAT_WEBHOOK_URL = settings.chat_webhook_url
 CHAT_BATCH_SIZE = settings.chat_batch_size
+FORM_POST_URL = settings.form_post_url
 
 INITIAL_CONCURRENCY = settings.initial_concurrency
 NUM_FORM_SUBMITTERS = settings.num_form_submitters
@@ -105,9 +110,6 @@ UPH_THRESHOLD = 80
 LATES_THRESHOLD = 3.0
 INF_THRESHOLD = 2.0
 
-FORM_POST_URL = (
-    "https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse"
-)
 FIELD_MAP = {
     "date": "entry.1483325020",
     "store": "entry.117918617",

@@ -185,6 +185,12 @@ You do not need `config.json` for `scraper.py`.
    pip install -r requirements.txt
    ```
 
+   For local validation and unit tests, install the dev extras instead:
+
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
 2. Install Playwright Chromium:
 
    ```bash
@@ -205,6 +211,36 @@ You do not need `config.json` for `scraper.py`.
    python scraper.py
    ```
 
+## Testing
+
+Install the dev dependencies before running the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run the full unit test suite:
+
+```bash
+pytest -q
+```
+
+Run a single test file while working on one area:
+
+```bash
+pytest -q tests/test_runtime.py
+```
+
+Run the same lightweight validation used in CI:
+
+```bash
+python -m compileall scraper.py core services tests
+pytest -q
+```
+
+The automated test suite only collects files under `tests/`.
+Browser investigation scripts in `scripts/debug/` are manual probes, are not part of `pytest`, and may require a valid `.env` plus `state.json`.
+
 ## Environment Variables
 
 | Variable | Required | Purpose | Default |
@@ -216,6 +252,8 @@ You do not need `config.json` for `scraper.py`.
 | `OTP_SECRET_KEY` | Yes | TOTP secret used for 2FA generation | none |
 | `TARGET_URL` | No | Dashboard landing page used for session verification and navigation | Seller Central 1MMS dashboard URL |
 | `CHAT_WEBHOOK_URL` | No | Google Chat webhook for KPI and summary cards | empty |
+| `CHAT_BATCH_SIZE` | No | Number of successful store rows to batch into each Google Chat card | `100` |
+| `FORM_POST_URL` | No | Google Forms endpoint that receives normalized store rows | bundled default |
 | `INITIAL_CONCURRENCY` | No | Initial number of browser workers | `30` |
 | `NUM_FORM_SUBMITTERS` | No | Number of submission workers for Google Forms | `2` |
 | `AUTO_ENABLED` | No | Enable automatic concurrency adjustment | `true` |
@@ -239,8 +277,10 @@ The workflow also:
 
 This artifact-based persistence is what allows the scraper to keep its auth state and fast-path cache across runs.
 
+The lightweight validation workflow in [`.github/workflows/validate.yml`](./.github/workflows/validate.yml) is kept separate from the production scheduler and only runs `compileall` plus `pytest`.
+
 ## Repository Notes
 
 - The main runtime path is the environment-based `scraper.py` flow.
-- `config.json` and some helper scripts remain in the repo as troubleshooting artifacts from an older setup.
-- Files like `test_dropdown.py`, `test_account_picker.py`, and `test_woking.py` are targeted debugging or validation scripts rather than part of the production pipeline.
+- Unit tests now live under `tests/` and are intentionally isolated from the browser probe scripts.
+- Debugging probes live under `scripts/debug/` and write any captured HTML into `output/debug/`.

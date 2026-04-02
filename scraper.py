@@ -1,8 +1,6 @@
 import asyncio
-import csv
 import json
 import os
-import re
 from datetime import datetime
 
 import psutil
@@ -25,10 +23,11 @@ from core.config import (
     NUM_FORM_SUBMITTERS,
     PAGE_TIMEOUT,
     STORAGE_STATE,
-    STORE_PREFIX_RE,
 )
 from core.logger import app_logger
 from core.state import ScraperState
+from core.store_loader import load_stores_from_csv
+from core.utils import safe_close
 from services.auth_service import check_if_login_needed, prime_master_session
 from services.chat_service import flush_pending_chat_entries, post_job_summary
 from services.forms_service import http_form_submitter_worker
@@ -36,40 +35,22 @@ from services.metrics_service import process_single_store
 
 
 def load_default_data(state: ScraperState) -> list:
-    urls_data = []
     state.cache.load()
 
     try:
-        with open("urls.csv", newline="") as f:
-            reader = csv.reader(f)
-            next(reader)  # Skip header
-            for i, row in enumerate(reader):
-                if not row:
-                    continue
-                raw_store_name = (
-                    row[2].strip() if len(row) > 2 and row[2].strip() else (row[0].strip() if row[0].strip() else "")
-                )
-                if not raw_store_name:
-                    app_logger.warning(f"Skipping row {i + 2} in urls.csv: no store name found")
-                    continue
-
-                formatted_name = STORE_PREFIX_RE.sub("", raw_store_name).strip()
-                formatted_name = re.sub(r"(?i)\s*Morrisons?$", "", formatted_name)
-
-                urls_data.append(
-                    {
-                        "store_name": raw_store_name,
-                        "dropdown_name": formatted_name,
-                        "merchant_id": row[0].strip() if len(row) > 0 else "",
-                        "marketplace_id": row[3].strip() if len(row) > 3 else "",
-                    }
-                )
+        urls_data = load_stores_from_csv(
+            "urls.csv",
+            on_skip=lambda row_number, _row: app_logger.warning(
+                f"Skipping row {row_number} in urls.csv: no store name found"
+            ),
+        )
         app_logger.info(f"{len(urls_data)} stores loaded from urls.csv")
     except FileNotFoundError:
         app_logger.error("FATAL: 'urls.csv' not found.")
         raise
     except Exception:
         app_logger.exception("An error occurred while loading urls.csv")
+        raise
 
     return urls_data
 
@@ -97,7 +78,7 @@ async def auto_concurrency_manager(state: ScraperState):
         return
     app_logger.info(f"Auto-concurrency enabled with range {AUTO_MIN_CONCURRENCY}-{AUTO_MAX_CONCURRENCY}")
     while True:
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
 
         async with state.failure_lock:
             while state.failure_timestamps and now - state.failure_timestamps[0] > 60:
@@ -182,6 +163,14 @@ async def worker_task(
 
             try:
                 await process_single_store(page, store_item, submission_queue, state)
+            except Exception as exc:
+                store_name = store_item.get("store_name", f"Worker-{worker_id}")
+                app_logger.exception(f"[Worker-{worker_id}] Unhandled exception while processing {store_name}: {exc}")
+                await state.add_failure(
+                    f"{store_name} (Worker Exception)",
+                    asyncio.get_running_loop().time(),
+                    category="worker",
+                )
             finally:
                 async with state.concurrency_condition:
                     state.active_workers_count -= 1
@@ -189,12 +178,15 @@ async def worker_task(
                 job_queue.task_done()
 
     except Exception as e:
-        app_logger.error(f"[Worker-{worker_id}] Crashed: {e}")
+        app_logger.error(f"[Worker-{worker_id}] Crashed during setup: {e}")
+        await state.add_failure(
+            f"Worker-{worker_id} (Worker Setup Exception)",
+            asyncio.get_running_loop().time(),
+            category="worker",
+        )
     finally:
-        if page:
-            await page.close()
-        if context:
-            await context.close()
+        await safe_close(page, f"Worker-{worker_id} page", state.record_issue)
+        await safe_close(context, f"Worker-{worker_id} context", state.record_issue)
         app_logger.info(f"[Worker-{worker_id}] Shutting down.")
 
 
@@ -225,8 +217,7 @@ async def process_urls(browser: Browser, state: ScraperState):
         except Exception as e:
             app_logger.error(f"An error occurred during session verification: {e}", exc_info=DEBUG_MODE)
         finally:
-            if temp_context:
-                await temp_context.close()
+            await safe_close(temp_context, "Session verification context", state.record_issue)
     else:
         app_logger.info("No existing auth state file found. Login is required.")
 
@@ -322,12 +313,20 @@ async def main():
         app_logger.critical(f"A critical error occurred in the main execution block: {e}", exc_info=DEBUG_MODE)
     finally:
         app_logger.info("Task finished. Initiating shutdown...")
-        if browser and browser.is_connected():
-            await browser.close()
+        if browser:
+            await safe_close(browser, "Browser", state.record_issue)
             app_logger.info("Browser instance closed.")
         if playwright:
-            await playwright.stop()
-            app_logger.info("Playwright stopped.")
+            try:
+                await playwright.stop()
+                app_logger.info("Playwright stopped.")
+            except Exception as exc:
+                app_logger.warning(f"Failed to stop Playwright cleanly: {exc}")
+                await state.record_issue(
+                    "Playwright stop (Cleanup failure)",
+                    asyncio.get_running_loop().time(),
+                    category="cleanup",
+                )
         await flush_pending_chat_entries(state)
         app_logger.info("Run complete.")
 

@@ -14,6 +14,7 @@ from core.config import (
     UPH_THRESHOLD,
 )
 from core.logger import app_logger
+from core.reporting import FAILURE_CATEGORY_LABELS, summarize_failure_events
 from core.state import ScraperState
 from core.utils import format_metric_with_emoji, sanitize_store_name
 
@@ -103,6 +104,7 @@ async def post_job_summary(state: ScraperState, duration: float):
         total = state.progress["total"]
         success = state.progress["current"]
         failures = state.run_failures
+        failure_events = state.failure_events
 
         status_text = "Job Completed Successfully"
         status_icon = "✅"
@@ -252,23 +254,29 @@ async def post_job_summary(state: ScraperState, duration: float):
 
         sections = [stats_section, volume_section, resilience_section, speed_section, extremes_section]
 
-        if failures:
-            failure_counts = {}
-            for f in failures:
-                msg = f
-                if "(" in f and ")" in f:
-                    msg = f[f.rfind("(") + 1 : f.rfind(")")]
-                failure_counts[msg] = failure_counts.get(msg, 0) + 1
-
-            failure_summary = "\n".join([f"• {k}: {v}" for k, v in failure_counts.items()])
-            failure_list = "\n".join([f"• {f}" for f in failures[:5]])
-            if len(failures) > 5:
-                failure_list += f"\n...and {len(failures) - 5} more"
+        if failure_events:
+            failure_summary = summarize_failure_events(failure_events)
+            category_breakdown = "\n".join(
+                [
+                    f"• {FAILURE_CATEGORY_LABELS.get(category, category.title())}: {count}"
+                    for category, count in sorted(failure_summary["category_counts"].items())
+                ]
+            )
+            reason_breakdown = "\n".join(
+                [
+                    f"• {reason}: {count}"
+                    for reason, count in sorted(failure_summary["reason_counts"].items())
+                ]
+            )
+            failure_list = "\n".join([f"• {failure}" for failure in failure_summary["recent_failures"]])
+            if failure_summary["overflow_count"]:
+                failure_list += f"\n...and {failure_summary['overflow_count']} more"
 
             failures_section = {
-                "header": "Failure Analysis",
+                "header": "Failure Analysis" if failures else "Issue Analysis",
                 "widgets": [
-                    {"textParagraph": {"text": f"<b>Breakdown:</b>\n{failure_summary}"}},
+                    {"textParagraph": {"text": f"<b>By Category:</b>\n{category_breakdown}"}},
+                    {"textParagraph": {"text": f"<b>By Reason:</b>\n{reason_breakdown}"}},
                     {
                         "textParagraph": {
                             "text": f'<font color="#FF0000"><b>Recent Failures:</b>\n{failure_list}</font>'
