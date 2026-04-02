@@ -68,6 +68,18 @@ class CacheManager:
 
 class ScraperState:
     def __init__(self):
+        self.run_started_at = datetime.now(LOCAL_TIMEZONE)
+        self.run_finished_at = None
+        self.job_trigger = os.getenv("GITHUB_EVENT_NAME", "local")
+        self.job_status = "running"
+        self.job_status_detail = ""
+        self.fatal_error_message = ""
+        self.auth_state_status = "unknown"
+        self.cache_template_available_at_start = False
+        self.cache_merchant_ids_at_start = 0
+        self.browser_worker_pool_size = 0
+        self.form_submitter_count = 0
+
         self.progress = {"current": 0, "total": 0, "lastUpdate": "N/A"}
         self.progress_lock = asyncio.Lock()
 
@@ -100,6 +112,13 @@ class ScraperState:
 
         self.cache = CacheManager()
 
+    def finish_run(self):
+        self.run_finished_at = datetime.now(LOCAL_TIMEZONE)
+
+    def set_job_status(self, status: str, detail: str = ""):
+        self.job_status = status
+        self.job_status_detail = detail
+
     async def init_progress(self, total: int):
         async with self.progress_lock:
             self.progress["total"] = total
@@ -113,13 +132,27 @@ class ScraperState:
 
     async def record_issue(self, failure_msg: str, timestamp: float, category: str = "general"):
         async with self.failure_lock:
-            self.failure_events.append({"message": failure_msg, "category": category, "terminal": False})
+            self.failure_events.append(
+                {
+                    "message": failure_msg,
+                    "category": category,
+                    "terminal": False,
+                    "timestamp": datetime.now(LOCAL_TIMEZONE).isoformat(),
+                }
+            )
 
     async def add_failure(self, failure_msg: str, timestamp: float, category: str = "general"):
         async with self.failure_lock:
             self.run_failures.append(failure_msg)
             self.failure_timestamps.append(timestamp)
-            self.failure_events.append({"message": failure_msg, "category": category, "terminal": True})
+            self.failure_events.append(
+                {
+                    "message": failure_msg,
+                    "category": category,
+                    "terminal": True,
+                    "timestamp": datetime.now(LOCAL_TIMEZONE).isoformat(),
+                }
+            )
 
     async def record_metric(self, store_name: str, duration: float, orders: int, units: int):
         async with self.metrics_lock:

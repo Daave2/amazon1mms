@@ -37,6 +37,8 @@ jobs:
     outputs:
       # This output will be 'true' if it's the right time, 'false' otherwise.
       run_job: ${{ steps.check_hour.outputs.run_job }}
+      current_uk_hour: ${{ steps.check_hour.outputs.current_uk_hour }}
+      gate_reason: ${{ steps.check_hour.outputs.gate_reason }}
     steps:
       - name: Check current UK hour against target hours
         id: check_hour
@@ -44,6 +46,14 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Manual trigger detected. The main job will run."
             echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "current_uk_hour=manual" >> $GITHUB_OUTPUT
+            echo "gate_reason=manual_dispatch" >> $GITHUB_OUTPUT
+            {
+              echo "## Run Gate"
+              echo ""
+              echo "- Trigger: \`workflow_dispatch\`"
+              echo "- Decision: run scraper"
+            } >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
           # Get the current hour in London timezone (e.g., "09", "10", "17")
@@ -51,14 +61,27 @@ jobs:
           CURRENT_UK_HOUR=$(TZ="Europe/London" date +'%H')
           echo "Current UK hour is: ${CURRENT_UK_HOUR}"
           echo "Target hours are: ${{ env.UK_TARGET_HOURS }}"
+          echo "current_uk_hour=${CURRENT_UK_HOUR}" >> $GITHUB_OUTPUT
           # Check if the current hour is in our list of target hours
           if [[ " ${{ env.UK_TARGET_HOURS }} " =~ " ${CURRENT_UK_HOUR} " ]]; then
             echo "It's a target time. The main job will run."
             echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_window_match" >> $GITHUB_OUTPUT
+            DECISION="run scraper"
           else
             echo "Not a target time. The main job will be skipped."
             echo "run_job=false" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_window_skip" >> $GITHUB_OUTPUT
+            DECISION="skip scraper"
           fi
+          {
+            echo "## Run Gate"
+            echo ""
+            echo "- Trigger: \`schedule\`"
+            echo "- Current London hour: \`${CURRENT_UK_HOUR}\`"
+            echo "- Allowed hours: \`${{ env.UK_TARGET_HOURS }}\`"
+            echo "- Decision: ${DECISION}"
+          } >> $GITHUB_STEP_SUMMARY
   # ==============================================================================
   # JOB 2: SCRAPE AND SUBMIT
   # This is your main job. It will ONLY run if the 'check-time' job above
@@ -70,6 +93,17 @@ jobs:
 
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      LOGIN_URL: ${{ secrets.LOGIN_URL }}
+      LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
+      LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+      OTP_SECRET_KEY: ${{ secrets.OTP_SECRET_KEY }}
+      CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
+      TARGET_URL: ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
+      FORM_POST_URL: ${{ secrets.FORM_POST_URL || 'https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse' }}
+      AUTO_MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || 40 }}
+      INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || 25 }}
+      NUM_FORM_SUBMITTERS: ${{ secrets.NUM_SUBMITTERS || 5 }}
 
     steps:
     - uses: actions/checkout@v4
@@ -82,16 +116,6 @@ jobs:
 
     - name: Install Python dependencies
       run: pip install -r requirements.txt
-
-    - name: Cache Playwright browsers
-      uses: actions/cache@v4
-      id: playwright-cache
-      with:
-        path: ~/.cache/ms-playwright
-        key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
-
-    - name: Install Playwright browsers & deps
-      run: python -m playwright install --with-deps chromium
 
     - name: Download Persistent Data (Fast Path Cache)
       uses: dawidd6/action-download-artifact@v6
@@ -111,18 +135,99 @@ jobs:
         if_no_artifact_found: warn
         search_artifacts: true
 
+    - name: Run preflight checks
+      run: python scripts/preflight.py
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@v4
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+    - name: Install Playwright browsers & deps
+      run: python -m playwright install --with-deps chromium
+
     - name: Run scraper
-      env:
-        LOGIN_URL:       ${{ secrets.LOGIN_URL }}
-        LOGIN_EMAIL:     ${{ secrets.LOGIN_EMAIL }}
-        LOGIN_PASSWORD:  ${{ secrets.LOGIN_PASSWORD }}
-        OTP_SECRET_KEY:  ${{ secrets.OTP_SECRET_KEY }}
-        CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
-        TARGET_URL:      ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
-        AUTO_MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || 40 }}
-        INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || 25 }}
-        NUM_FORM_SUBMITTERS:  ${{ secrets.NUM_SUBMITTERS || 5 }}
       run: python scraper.py
+
+    - name: Write GitHub step summary
+      if: always()
+      env:
+        GATE_CURRENT_UK_HOUR: ${{ needs.check-time.outputs.current_uk_hour }}
+        GATE_REASON: ${{ needs.check-time.outputs.gate_reason }}
+      run: |
+        python - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        lines = ["## Scraper Run Summary", ""]
+        gate_reason = os.getenv("GATE_REASON", "")
+        gate_hour = os.getenv("GATE_CURRENT_UK_HOUR", "")
+
+        if gate_reason:
+            lines.append("### Gate")
+            lines.append("")
+            lines.append(f"- Gate reason: `{gate_reason}`")
+            if gate_hour and gate_hour != "manual":
+                lines.append(f"- Current London hour: `{gate_hour}`")
+            lines.append("")
+
+        summary_path = Path("output/run_summary.json")
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            stores = summary.get("stores", {})
+            retries = summary.get("retries", {})
+            collection = summary.get("collection_metrics", {})
+
+            lines.extend(
+                [
+                    f"- Status: `{summary.get('status', 'unknown')}`",
+                    f"- Trigger: `{summary.get('trigger', 'unknown')}`",
+                    f"- Duration: `{summary.get('elapsed_seconds', 0)}s`",
+                    f"- Successful submissions: `{stores.get('successful_submissions', 0)}` / `{stores.get('total', 0)}`",
+                    f"- Terminal failures: `{stores.get('failed', 0)}`",
+                    f"- Retries: `{retries.get('total', 0)}` across `{retries.get('stores', 0)}` store(s)",
+                    f"- Auth state: `{summary.get('auth', {}).get('state', 'unknown')}`",
+                    f"- Discovery template at start: `{summary.get('discovery_cache', {}).get('template_available_at_start', False)}`",
+                    "",
+                ]
+            )
+
+            fastest = collection.get("fastest_store")
+            slowest = collection.get("slowest_store")
+            if fastest or slowest:
+                lines.append("### Timing")
+                lines.append("")
+                if fastest:
+                    lines.append(f"- Fastest store: `{fastest['store']}` in `{fastest['seconds']}s`")
+                if slowest:
+                    lines.append(f"- Slowest store: `{slowest['store']}` in `{slowest['seconds']}s`")
+                lines.append("")
+
+            category_counts = summary.get("failure_summary", {}).get("category_counts", {})
+            if category_counts:
+                lines.append("### Failure Categories")
+                lines.append("")
+                lines.append("| Category | Count |")
+                lines.append("| --- | ---: |")
+                for category, count in sorted(category_counts.items()):
+                    lines.append(f"| `{category}` | {count} |")
+                lines.append("")
+
+            recent_failures = summary.get("failure_summary", {}).get("recent_failures", [])
+            if recent_failures:
+                lines.append("### Recent Failures")
+                lines.append("")
+                for failure in recent_failures:
+                    lines.append(f"- {failure}")
+        else:
+            lines.append("Runtime summary was not generated. Check the preflight step or earlier job failure output.")
+
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as file_handle:
+            file_handle.write("\n".join(lines) + "\n")
+        PY
 
     - name: Upload artifacts on failure or success
       if: always()
@@ -132,6 +237,7 @@ jobs:
         path: |
           output/
           app.log
+        if-no-files-found: warn
         retention-days: 7
 
     - name: Upload Persistent Data (Fast Path Cache)

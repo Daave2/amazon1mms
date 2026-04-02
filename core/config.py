@@ -56,13 +56,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
-try:
-    settings = Settings()
-except Exception as e:
-    import sys
+def load_settings() -> Settings:
+    try:
+        return Settings()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Invalid runtime configuration: {exc}. Run 'python scripts/preflight.py' for a full validation report."
+        ) from exc
 
-    print(f"CRITICAL CONFIGURATION ERROR: {e}")
-    sys.exit(1)
+
+settings = load_settings()
 
 LOCAL_TIMEZONE = timezone(settings.local_timezone)
 DEBUG_MODE = settings.debug_mode

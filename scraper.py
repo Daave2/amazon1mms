@@ -25,6 +25,7 @@ from core.config import (
     STORAGE_STATE,
 )
 from core.logger import app_logger
+from core.reporting import write_runtime_reports
 from core.state import ScraperState
 from core.store_loader import load_stores_from_csv
 from core.utils import safe_close
@@ -36,6 +37,8 @@ from services.metrics_service import process_single_store
 
 def load_default_data(state: ScraperState) -> list:
     state.cache.load()
+    state.cache_template_available_at_start = bool(state.cache.api_url_template)
+    state.cache_merchant_ids_at_start = len(state.cache.merchant_id_cache)
 
     try:
         urls_data = load_stores_from_csv(
@@ -192,12 +195,15 @@ async def worker_task(
 
 async def process_urls(browser: Browser, state: ScraperState):
     pool_size = INITIAL_CONCURRENCY
+    state.browser_worker_pool_size = pool_size
+    state.form_submitter_count = NUM_FORM_SUBMITTERS
     state.concurrency_limit = pool_size
     app_logger.info(f"Job 'process_urls' started with Worker Pool size: {pool_size}")
 
     urls_data = load_default_data(state)
     if not urls_data:
         app_logger.error("No URLs to process. Aborting job.")
+        state.set_job_status("aborted_no_stores", "No usable stores were found in urls.csv")
         return
 
     login_is_required = True
@@ -212,14 +218,18 @@ async def process_urls(browser: Browser, state: ScraperState):
             if not await check_if_login_needed(temp_page, BASE_DASHBOARD_URL):
                 app_logger.info("Session verification successful. Skipping login.")
                 login_is_required = False
+                state.auth_state_status = "reused"
             else:
                 app_logger.warning("Session has expired or is invalid. A new login is required.")
+                state.auth_state_status = "refresh_required"
         except Exception as e:
             app_logger.error(f"An error occurred during session verification: {e}", exc_info=DEBUG_MODE)
+            state.auth_state_status = "refresh_required"
         finally:
             await safe_close(temp_context, "Session verification context", state.record_issue)
     else:
         app_logger.info("No existing auth state file found. Login is required.")
+        state.auth_state_status = "missing"
 
     if login_is_required:
         MAX_LOGIN_ATTEMPTS = 3
@@ -234,7 +244,10 @@ async def process_urls(browser: Browser, state: ScraperState):
 
         if not login_successful:
             app_logger.critical(f"Critical: Session priming failed after {MAX_LOGIN_ATTEMPTS} attempts. Aborting job.")
+            state.auth_state_status = "refresh_failed"
+            state.set_job_status("login_aborted", f"Session priming failed after {MAX_LOGIN_ATTEMPTS} attempts")
             return
+        state.auth_state_status = "refreshed"
 
     with open(STORAGE_STATE) as f:
         storage_template = json.load(f)
@@ -284,8 +297,10 @@ async def process_urls(browser: Browser, state: ScraperState):
     state.cache.update_csv_with_cache()
 
     if state.run_failures:
+        state.set_job_status("completed_with_failures", f"{len(state.run_failures)} terminal failure(s)")
         app_logger.warning(f"Completed with {len(state.run_failures)} issue(s): {', '.join(state.run_failures)}")
     else:
+        state.set_job_status("completed", "Run completed successfully")
         app_logger.info("Completed successfully.")
 
 
@@ -310,6 +325,8 @@ async def main():
         app_logger.info("Browser launched successfully.")
         await process_urls(browser, state)
     except Exception as e:
+        state.fatal_error_message = str(e)
+        state.set_job_status("fatal", "Unhandled exception in main execution block")
         app_logger.critical(f"A critical error occurred in the main execution block: {e}", exc_info=DEBUG_MODE)
     finally:
         app_logger.info("Task finished. Initiating shutdown...")
@@ -328,6 +345,16 @@ async def main():
                     category="cleanup",
                 )
         await flush_pending_chat_entries(state)
+        if state.job_status == "running":
+            default_status = "completed_with_failures" if state.run_failures else "completed"
+            default_detail = "Run exited during shutdown with recorded failures" if state.run_failures else "Run completed during shutdown"
+            state.set_job_status(default_status, default_detail)
+        state.finish_run()
+        try:
+            write_runtime_reports(state)
+            app_logger.info("Runtime reports written.")
+        except Exception as exc:
+            app_logger.warning(f"Failed to write runtime reports: {exc}")
         app_logger.info("Run complete.")
 
 

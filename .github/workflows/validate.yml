@@ -22,7 +22,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Compile project
-        run: python -m compileall scraper.py core services
+        run: python -m compileall scraper.py core services scripts
 
       - name: Run tests
-        run: pytest -q
+        run: pytest --cov=. --cov-report=term-missing:skip-covered -q
