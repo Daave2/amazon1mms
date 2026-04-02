@@ -148,7 +148,7 @@ class FakeBrowser:
         return context
 
 
-def test_filter_stores_to_live_dropdown_only_keeps_currently_listed_stores():
+def test_filter_stores_to_live_dropdown_queues_all_live_stores_and_uses_live_merchant_ids():
     urls_data = [
         {"store_name": "Belle Vale Morrisons", "merchant_id": "", "marketplace_id": "", "dropdown_name": "Belle Vale"},
         {
@@ -156,6 +156,18 @@ def test_filter_stores_to_live_dropdown_only_keeps_currently_listed_stores():
             "merchant_id": "",
             "marketplace_id": "",
             "dropdown_name": "Cardiff Tygals",
+        },
+        {
+            "store_name": "Morrisons Welling",
+            "merchant_id": "STALE-ID",
+            "marketplace_id": "",
+            "dropdown_name": "Welling",
+        },
+        {
+            "store_name": "Morrisons Welwyn",
+            "merchant_id": "LIVE-WELWYN-ID",
+            "marketplace_id": "",
+            "dropdown_name": "Welwyn",
         },
         {"store_name": "Morrisons Missing Store", "merchant_id": "", "marketplace_id": "", "dropdown_name": "Missing"},
     ]
@@ -170,6 +182,16 @@ def test_filter_stores_to_live_dropdown_only_keeps_currently_listed_stores():
             "normalized_name": "cardiff tyglass",
             "merchant_id": "A3W2L835GZRAX2",
         },
+        {
+            "store_name": "Welling",
+            "normalized_name": "welling",
+            "merchant_id": "LIVE-WELLING-ID",
+        },
+        {
+            "store_name": "Welwyn Garden",
+            "normalized_name": "welwyn garden",
+            "merchant_id": "LIVE-WELWYN-ID",
+        },
     ]
 
     filtered, skipped = scraper.filter_stores_to_live_dropdown(urls_data, available_stores)
@@ -177,10 +199,20 @@ def test_filter_stores_to_live_dropdown_only_keeps_currently_listed_stores():
     assert [store["store_name"] for store in filtered] == [
         "Belle Vale Morrisons",
         "Morrisons Cardiff Tygals",
+        "Morrisons Welling",
+        "Morrisons Welwyn",
     ]
     assert [store["merchant_id"] for store in filtered] == [
         "A1KDGRVT6JAV6B",
         "A3W2L835GZRAX2",
+        "LIVE-WELLING-ID",
+        "LIVE-WELWYN-ID",
+    ]
+    assert [store["dropdown_name"] for store in filtered] == [
+        "Belle Vale",
+        "Cardiff Tyglass",
+        "Welling",
+        "Welwyn Garden",
     ]
     assert [store["store_name"] for store in skipped] == ["Morrisons Missing Store"]
 

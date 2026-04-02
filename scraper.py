@@ -32,7 +32,12 @@ from core.utils import safe_close
 from services.auth_service import check_if_login_needed, prime_master_session
 from services.chat_service import flush_pending_chat_entries, post_job_summary
 from services.forms_service import http_form_submitter_worker
-from services.metrics_service import discover_available_dropdown_stores, process_single_store, resolve_dropdown_name
+from services.metrics_service import (
+    _selection_matches_target,
+    discover_available_dropdown_stores,
+    process_single_store,
+    resolve_dropdown_name,
+)
 
 
 def load_default_data(state: ScraperState) -> list:
@@ -80,29 +85,123 @@ def filter_stores_to_live_dropdown(
     urls_data: list[dict[str, str]],
     available_stores: list[dict[str, str]],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    available_by_name: dict[str, dict[str, str]] = {}
+    indexed_configured_stores = [
+        {
+            **store,
+            "_index": index,
+            "_resolved_name": resolve_dropdown_name(store["store_name"]),
+        }
+        for index, store in enumerate(urls_data)
+    ]
+    configured_by_merchant: dict[str, list[dict[str, str]]] = {}
+    configured_by_name: dict[str, list[dict[str, str]]] = {}
+
+    for configured_store in indexed_configured_stores:
+        merchant_id = configured_store.get("merchant_id", "").strip()
+        if merchant_id:
+            configured_by_merchant.setdefault(merchant_id, []).append(configured_store)
+        configured_by_name.setdefault(configured_store["_resolved_name"], []).append(configured_store)
+
+    matched_configured_indices: set[int] = set()
+    queue_stores: list[dict[str, str]] = []
+
     for available_store in available_stores:
-        normalized_name = available_store.get("normalized_name", "").strip()
-        if normalized_name and normalized_name not in available_by_name:
-            available_by_name[normalized_name] = available_store
+        matched_store = _match_configured_store_for_live_option(
+            available_store,
+            indexed_configured_stores,
+            configured_by_merchant,
+            configured_by_name,
+            matched_configured_indices,
+        )
+        if matched_store:
+            matched_configured_indices.add(matched_store["_index"])
 
-    filtered_stores: list[dict[str, str]] = []
-    skipped_stores: list[dict[str, str]] = []
+        queue_stores.append(
+            {
+                "store_name": matched_store["store_name"] if matched_store else available_store["store_name"],
+                "dropdown_name": available_store["store_name"],
+                "merchant_id": available_store.get("merchant_id", "").strip()
+                or (matched_store.get("merchant_id", "").strip() if matched_store else ""),
+                "marketplace_id": matched_store.get("marketplace_id", "").strip() if matched_store else "",
+                "matched_from_configured": bool(matched_store),
+            }
+        )
 
-    for store in urls_data:
-        normalized_name = resolve_dropdown_name(store["store_name"])
-        matched_store = available_by_name.get(normalized_name)
-        if not matched_store:
-            skipped_stores.append(store)
-            continue
+    skipped_stores = [
+        {
+            key: value
+            for key, value in configured_store.items()
+            if not key.startswith("_")
+        }
+        for configured_store in indexed_configured_stores
+        if configured_store["_index"] not in matched_configured_indices
+    ]
 
-        filtered_store = dict(store)
-        merchant_id = matched_store.get("merchant_id", "").strip()
-        if merchant_id and not filtered_store.get("merchant_id"):
-            filtered_store["merchant_id"] = merchant_id
-        filtered_stores.append(filtered_store)
+    return queue_stores, skipped_stores
 
-    return filtered_stores, skipped_stores
+
+def _match_configured_store_for_live_option(
+    available_store: dict[str, str],
+    configured_stores: list[dict[str, str]],
+    configured_by_merchant: dict[str, list[dict[str, str]]],
+    configured_by_name: dict[str, list[dict[str, str]]],
+    matched_configured_indices: set[int],
+) -> dict[str, str] | None:
+    live_name = available_store["store_name"]
+    live_normalized_name = available_store.get("normalized_name", "").strip()
+    live_merchant_id = available_store.get("merchant_id", "").strip()
+
+    merchant_candidates = [
+        candidate
+        for candidate in configured_by_merchant.get(live_merchant_id, [])
+        if candidate["_index"] not in matched_configured_indices
+    ]
+    matched_store = _pick_best_configured_candidate(merchant_candidates, live_name, live_normalized_name)
+    if matched_store:
+        return matched_store
+
+    name_candidates = [
+        candidate
+        for candidate in configured_by_name.get(live_normalized_name, [])
+        if candidate["_index"] not in matched_configured_indices
+    ]
+    matched_store = _pick_best_configured_candidate(name_candidates, live_name, live_normalized_name)
+    if matched_store:
+        return matched_store
+
+    fuzzy_candidates = [
+        candidate
+        for candidate in configured_stores
+        if candidate["_index"] not in matched_configured_indices
+        and _selection_matches_target(live_name, candidate["_resolved_name"], candidate["store_name"])
+    ]
+    return _pick_best_configured_candidate(fuzzy_candidates, live_name, live_normalized_name)
+
+
+def _pick_best_configured_candidate(
+    candidates: list[dict[str, str]],
+    live_name: str,
+    live_normalized_name: str,
+) -> dict[str, str] | None:
+    if not candidates:
+        return None
+
+    exact_name_matches = [candidate for candidate in candidates if candidate["_resolved_name"] == live_normalized_name]
+    if exact_name_matches:
+        return exact_name_matches[0]
+
+    fuzzy_matches = [
+        candidate
+        for candidate in candidates
+        if _selection_matches_target(live_name, candidate["_resolved_name"], candidate["store_name"])
+    ]
+    if fuzzy_matches:
+        return fuzzy_matches[0]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
 
 
 async def load_live_dropdown_stores(
@@ -134,14 +233,17 @@ async def load_live_dropdown_stores(
         if cache_updated:
             await state.cache.save()
 
+        matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
+        live_only_count = len(filtered_stores) - matched_configured_count
         app_logger.info(
-            f"Live dropdown filtering kept {len(filtered_stores)} of {len(urls_data)} configured store(s)."
+            f"Live dropdown queue contains {len(filtered_stores)} store(s): "
+            f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
         )
         if skipped_stores:
             skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
             suffix = "..." if len(skipped_stores) > 10 else ""
             app_logger.warning(
-                f"Skipping {len(skipped_stores)} configured store(s) not currently listed in the live dropdown: "
+                f"Ignoring {len(skipped_stores)} configured store(s) not currently listed in the live dropdown: "
                 f"{skipped_names}{suffix}"
             )
 

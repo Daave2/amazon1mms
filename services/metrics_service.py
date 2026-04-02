@@ -342,7 +342,8 @@ async def process_single_store(
 ):
     start_ts = asyncio.get_running_loop().time()
     store_name = store_info["store_name"]
-    dropdown_name = resolve_dropdown_name(store_name)
+    selection_store_name = store_info.get("dropdown_name") or store_name
+    dropdown_name = resolve_dropdown_name(selection_store_name)
 
     merchant_id = store_info.get("merchant_id") or state.cache.merchant_id_cache.get(store_name)
     METRICS_TIMEOUT = 45_000
