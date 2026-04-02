@@ -235,6 +235,7 @@ async def load_live_dropdown_stores(
             page = await context.new_page()
             await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until=wait_until)
             available_stores = await discover_available_dropdown_stores(page)
+            state.live_dropdown_discovery_attempt = attempt_name
             break
         except Exception as exc:
             last_exc = exc
@@ -265,6 +266,10 @@ async def load_live_dropdown_stores(
 
     matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
     live_only_count = len(filtered_stores) - matched_configured_count
+    state.live_dropdown_store_count = len(filtered_stores)
+    state.live_dropdown_matched_configured_count = matched_configured_count
+    state.live_dropdown_live_only_count = live_only_count
+    state.live_dropdown_skipped_configured_count = len(skipped_stores)
     app_logger.info(
         f"Live dropdown queue contains {len(filtered_stores)} store(s): "
         f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
@@ -505,15 +510,15 @@ async def process_urls(browser: Browser, state: ScraperState):
         f"Processing finished. Processed {state.progress['current']}/{state.progress['total']} in {elapsed:.2f}s"
     )
 
-    await post_job_summary(state, elapsed)
-    state.cache.update_csv_with_cache()
-
     if state.run_failures:
         state.set_job_status("completed_with_failures", f"{len(state.run_failures)} terminal failure(s)")
         app_logger.warning(f"Completed with {len(state.run_failures)} issue(s): {', '.join(state.run_failures)}")
     else:
         state.set_job_status("completed", "Run completed successfully")
         app_logger.info("Completed successfully.")
+
+    await post_job_summary(state, elapsed)
+    state.cache.update_csv_with_cache()
 
 
 async def main():
@@ -562,6 +567,7 @@ async def main():
             default_detail = "Run exited during shutdown with recorded failures" if state.run_failures else "Run completed during shutdown"
             state.set_job_status(default_status, default_detail)
         state.finish_run()
+        await post_job_summary(state)
         try:
             write_runtime_reports(state)
             app_logger.info("Runtime reports written.")

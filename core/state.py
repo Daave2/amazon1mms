@@ -79,6 +79,12 @@ class ScraperState:
         self.cache_merchant_ids_at_start = 0
         self.browser_worker_pool_size = 0
         self.form_submitter_count = 0
+        self.live_dropdown_store_count = 0
+        self.live_dropdown_matched_configured_count = 0
+        self.live_dropdown_live_only_count = 0
+        self.live_dropdown_skipped_configured_count = 0
+        self.live_dropdown_discovery_attempt = ""
+        self.job_summary_posted = False
 
         self.progress = {"current": 0, "total": 0, "lastUpdate": "N/A"}
         self.progress_lock = asyncio.Lock()
