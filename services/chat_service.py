@@ -21,7 +21,7 @@ from core.reporting import (
     build_run_summary,
 )
 from core.state import ScraperState
-from core.utils import sanitize_store_name
+from core.utils import format_metric_with_emoji, sanitize_store_name
 
 CARD_IMAGE_URL = "https://i.imgur.com/u0e3d2x.png"
 
@@ -211,6 +211,72 @@ def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
     return summary_lines
 
 
+def _build_batch_table_card(
+    entries: list[dict[str, str]],
+    batch_header_text: str,
+    batch_number: int,
+) -> dict[str, object]:
+    grid_items = [
+        {"title": "Store", "textAlignment": "START"},
+        {"title": "UPH", "textAlignment": "CENTER"},
+        {"title": "Lates", "textAlignment": "CENTER"},
+        {"title": "INF", "textAlignment": "CENTER"},
+    ]
+
+    for entry in entries:
+        uph_val = entry.get("uph", "N/A")
+        lates_val = entry.get("lates", "0.0 %") or "0.0 %"
+        inf_val = entry.get("inf", "0.0 %") or "0.0 %"
+
+        grid_items.extend(
+            [
+                {
+                    "title": sanitize_store_name(entry.get("store", "N/A")),
+                    "textAlignment": "START",
+                },
+                {
+                    "title": format_metric_with_emoji(uph_val, UPH_THRESHOLD, is_uph=True),
+                    "textAlignment": "CENTER",
+                },
+                {
+                    "title": format_metric_with_emoji(lates_val, LATES_THRESHOLD),
+                    "textAlignment": "CENTER",
+                },
+                {
+                    "title": format_metric_with_emoji(inf_val, INF_THRESHOLD),
+                    "textAlignment": "CENTER",
+                },
+            ]
+        )
+
+    return {
+        "cardId": f"batch-table-{batch_number}",
+        "card": {
+            "header": {
+                "title": "1MMS KPI Table",
+                "subtitle": f"{batch_header_text} • Batch {batch_number} • Full network view",
+                "imageUrl": CARD_IMAGE_URL,
+                "imageType": "CIRCLE",
+            },
+            "sections": [
+                {
+                    "header": "Store Metrics",
+                    "widgets": [
+                        {
+                            "grid": {
+                                "title": "Performance Snapshot",
+                                "columnCount": 4,
+                                "borderStyle": {"type": "STROKE", "cornerRadius": 4},
+                                "items": grid_items,
+                            }
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
 def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState) -> dict[str, object]:
     batch_header_text = datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M")
     card_subtitle = f"{batch_header_text} • Batch {state.chat_batch_count} • {len(entries)} stores"
@@ -319,7 +385,8 @@ def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState)
                     },
                     "sections": sections,
                 },
-            }
+            },
+            _build_batch_table_card(sorted_entries, batch_header_text, state.chat_batch_count),
         ]
     }
 

@@ -19,23 +19,37 @@ def test_build_batch_chat_payload_includes_attention_summary():
         state,
     )
 
-    card = payload["cardsV2"][0]["card"]
-    assert card["header"]["title"] == "1MMS KPI Batch"
-    assert [section["header"] for section in card["sections"]] == [
+    summary_card = payload["cardsV2"][0]["card"]
+    table_card = payload["cardsV2"][1]["card"]
+
+    assert len(payload["cardsV2"]) == 2
+    assert summary_card["header"]["title"] == "1MMS KPI Batch"
+    assert table_card["header"]["title"] == "1MMS KPI Table"
+    assert [section["header"] for section in summary_card["sections"]] == [
         "Batch Overview",
         "Batch Summary",
         "Metric Outliers",
     ]
-    assert "2" == card["sections"][0]["widgets"][0]["decoratedText"]["text"]
-    assert "2" == card["sections"][0]["widgets"][4]["decoratedText"]["text"]
-    summary_text = card["sections"][1]["widgets"][0]["textParagraph"]["text"]
-    outlier_text = card["sections"][2]["widgets"][0]["textParagraph"]["text"]
+    assert "2" == summary_card["sections"][0]["widgets"][0]["decoratedText"]["text"]
+    assert "2" == summary_card["sections"][0]["widgets"][4]["decoratedText"]["text"]
+    summary_text = summary_card["sections"][1]["widgets"][0]["textParagraph"]["text"]
+    outlier_text = summary_card["sections"][2]["widgets"][0]["textParagraph"]["text"]
+    table_items = table_card["sections"][0]["widgets"][0]["grid"]["items"]
     assert "UPH averaged 70.0 batch-wide, well below target versus the 80 target" in summary_text
     assert "Lates averaged 2.2% batch-wide" in summary_text
     assert "INF averaged 1.1% batch-wide" in summary_text
     assert "Lowest UPH: Welling (52.0), Belle Vale (88.0)" in outlier_text
     assert "Highest Lates: Belle Vale (4.5%), Welling (0.0%)" in outlier_text
     assert "Highest INF: Belle Vale (2.1%), Welling (0.0%)" in outlier_text
+    assert any(item["title"] == "Belle Vale" for item in table_items)
+    assert any(item["title"] == "Welling" for item in table_items)
+    assert len(table_items) == 12
+    assert table_items[:4] == [
+        {"title": "Store", "textAlignment": "START"},
+        {"title": "UPH", "textAlignment": "CENTER"},
+        {"title": "Lates", "textAlignment": "CENTER"},
+        {"title": "INF", "textAlignment": "CENTER"},
+    ]
 
 
 def test_build_batch_chat_payload_limits_outliers_to_worst_three():
@@ -55,13 +69,17 @@ def test_build_batch_chat_payload_limits_outliers_to_worst_three():
             state,
     )
 
-    card = payload["cardsV2"][0]["card"]
-    outlier_text = card["sections"][2]["widgets"][0]["textParagraph"]["text"]
+    summary_card = payload["cardsV2"][0]["card"]
+    table_card = payload["cardsV2"][1]["card"]
+    outlier_text = summary_card["sections"][2]["widgets"][0]["textParagraph"]["text"]
+    table_items = table_card["sections"][0]["widgets"][0]["grid"]["items"]
 
     assert "Lowest UPH: Store 01 (51.0), Store 02 (52.0), Store 03 (53.0)" in outlier_text
     assert "Highest Lates: Store 07 (0.7%), Store 06 (0.6%), Store 05 (0.5%)" in outlier_text
     assert "Highest INF: Store 07 (0.7%), Store 06 (0.6%), Store 05 (0.5%)" in outlier_text
     assert "Store 04" not in outlier_text
+    assert any(item["title"] == "Store 07" for item in table_items)
+    assert len(table_items) == 32
 
 
 def test_build_job_summary_payload_includes_run_context_and_issues():
