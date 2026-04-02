@@ -55,6 +55,7 @@ config_stub.SPECIAL_NAME_MAPPINGS = {
     "baglan moor": "baglan",
     "cardiff tygals": "cardiff tyglass",
     "connahs quay": "connahs quays",
+    "oxford": "carterton",
     "thornton cleveleys": "thornton-cleveleys",
     "auckland": "bishop aukland",
     "preston riversway": "preston",

@@ -67,8 +67,8 @@ def _build_search_terms(dropdown_name: str, store_name: str) -> list[str]:
 
 
 def _selection_matches_target(selected_text: str, dropdown_name: str, store_name: str) -> bool:
-    selected_norm = normalize_name(selected_text)
-    candidate_norms = {normalize_name(dropdown_name), normalize_name(store_name)}
+    selected_norm = resolve_dropdown_name(selected_text)
+    candidate_norms = {resolve_dropdown_name(dropdown_name), resolve_dropdown_name(store_name)}
 
     for candidate in candidate_norms:
         if not candidate:
@@ -86,7 +86,7 @@ def _parse_available_store_options(option_rows: list[tuple[str | None, str | Non
 
     for option_id, option_text in option_rows:
         cleaned_text = re.sub(r"\s+", " ", option_text or "").strip()
-        normalized_name = normalize_name(cleaned_text)
+        normalized_name = resolve_dropdown_name(cleaned_text)
         if not normalized_name or normalized_name in seen:
             continue
 
@@ -208,8 +208,8 @@ async def _select_option_via_overlay_text(page: Page, search_term: str, store_na
             seen.add(key)
             candidate_texts.append(cleaned)
 
-    target_norm = normalize_name(search_term)
-    normalized_map = {normalize_name(text): text for text in candidate_texts if normalize_name(text)}
+    target_norm = resolve_dropdown_name(search_term)
+    normalized_map = {resolve_dropdown_name(text): text for text in candidate_texts if resolve_dropdown_name(text)}
     matches = difflib.get_close_matches(target_norm, list(normalized_map.keys()), n=1, cutoff=0.55)
     if not matches:
         return False
