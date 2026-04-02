@@ -4,6 +4,7 @@ import pytest
 
 import scraper
 from core.state import ScraperState
+from core.work_items import WorkItem
 from services import metrics_service
 
 
@@ -27,10 +28,11 @@ class FakeRequestClient:
 
 
 class FakeContext:
-    def __init__(self, page, fail_on_close=False, request_client=None):
+    def __init__(self, page=None, fail_on_close=False, request_client=None):
         self.request = request_client or FakeRequestClient()
         self._page = page
         self.fail_on_close = fail_on_close
+        self.new_page_calls = 0
 
     def set_default_navigation_timeout(self, _timeout):
         pass
@@ -39,6 +41,9 @@ class FakeContext:
         pass
 
     async def new_page(self):
+        self.new_page_calls += 1
+        if self._page is None:
+            raise AssertionError("new_page should not have been called for this context")
         return self._page
 
     async def close(self):
@@ -132,10 +137,11 @@ class FakePage:
 
 
 class FakeBrowser:
-    def __init__(self, page, fail_on_context_close=False, request_client=None):
+    def __init__(self, page=None, fail_on_context_close=False, request_client=None):
         self._page = page
         self.fail_on_context_close = fail_on_context_close
         self.request_client = request_client
+        self.created_contexts: list[FakeContext] = []
 
     async def new_context(self, storage_state):
         assert storage_state == {"cookies": [{"name": "session"}]}
@@ -144,7 +150,9 @@ class FakeBrowser:
             fail_on_close=self.fail_on_context_close,
             request_client=self.request_client,
         )
-        self._page.context = context
+        self.created_contexts.append(context)
+        if self._page is not None:
+            self._page.context = context
         return context
 
 
@@ -217,19 +225,59 @@ def test_filter_stores_to_live_dropdown_queues_all_live_stores_and_uses_live_mer
     assert [store["store_name"] for store in skipped] == ["Morrisons Missing Store"]
 
 
+def test_route_store_work_items_prefers_fast_path_when_template_and_merchant_id_exist():
+    state = ScraperState()
+    state.cache_template_available_at_start = True
+    state.cache.merchant_id_cache["Cached Merchant Store"] = "CACHE-MID"
+
+    fast_path_items, ui_items = scraper.route_store_work_items(
+        [
+            {"store_name": "Ready Store", "dropdown_name": "Ready", "merchant_id": "MID-1", "marketplace_id": ""},
+            {"store_name": "Cached Merchant Store", "dropdown_name": "Cached", "merchant_id": "", "marketplace_id": ""},
+            {"store_name": "Needs UI Store", "dropdown_name": "Needs UI", "merchant_id": "", "marketplace_id": ""},
+        ],
+        state,
+    )
+
+    assert [item.store_name for item in fast_path_items] == ["Ready Store", "Cached Merchant Store"]
+    assert [item.merchant_id for item in fast_path_items] == ["MID-1", "CACHE-MID"]
+    assert [item.store_name for item in ui_items] == ["Needs UI Store"]
+    assert state.fast_path_eligible_at_start == 2
+    assert state.ui_routed_at_start == 1
+
+
+def test_route_store_work_items_disables_fast_path_routing_when_template_missing_at_start():
+    state = ScraperState()
+    state.cache_template_available_at_start = False
+    state.cache.api_url_template = "https://example.com/metrics?merchantIds%5B%5D={merchant_id}"
+    state.cache.merchant_id_cache["Cached Merchant Store"] = "CACHE-MID"
+
+    fast_path_items, ui_items = scraper.route_store_work_items(
+        [
+            {"store_name": "Ready Store", "dropdown_name": "Ready", "merchant_id": "MID-1", "marketplace_id": ""},
+            {"store_name": "Cached Merchant Store", "dropdown_name": "Cached", "merchant_id": "", "marketplace_id": ""},
+        ],
+        state,
+    )
+
+    assert fast_path_items == []
+    assert [item.store_name for item in ui_items] == ["Ready Store", "Cached Merchant Store"]
+    assert state.fast_path_eligible_at_start == 0
+    assert state.ui_routed_at_start == 2
+
+
 @pytest.mark.asyncio
-async def test_fast_path_retries_transient_503_then_succeeds(monkeypatch):
+async def test_fetch_metrics_fast_path_retries_transient_503_then_succeeds(monkeypatch):
     async def no_sleep(_seconds):
         return None
 
     monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
 
-    page = FakePage()
-    page.context = FakeContext(page, request_client=FakeRequestClient([503, 200]))
+    request_client = FakeRequestClient([503, 200])
     state = ScraperState()
 
-    payload = await metrics_service._fetch_metrics_fast_path(
-        page,
+    payload = await metrics_service.fetch_metrics_fast_path(
+        request_client,
         "https://example.com/metrics?merchantIds%5B%5D=MID123",
         "Belle Vale Morrisons",
         state,
@@ -240,7 +288,7 @@ async def test_fast_path_retries_transient_503_then_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_process_single_store_falls_back_to_ui_after_fast_path_failure(monkeypatch):
+async def test_process_ui_store_collects_metrics_and_updates_cache(monkeypatch):
     monkeypatch.setattr(metrics_service, "select_store_from_dropdown", lambda *args, **kwargs: asyncio.sleep(0))
     monkeypatch.setattr(metrics_service, "expect", lambda _locator: FakeExpectation())
 
@@ -248,12 +296,16 @@ async def test_process_single_store_falls_back_to_ui_after_fast_path_failure(mon
     page.context = FakeContext(page)
 
     state = ScraperState()
-    state.cache.api_url_template = "https://example.com/summationMetrics?merchantIds%5B%5D={merchant_id}"
     submission_queue = asyncio.Queue()
 
-    await metrics_service.process_single_store(
+    await metrics_service.process_ui_store(
         page,
-        {"store_name": "Belle Vale Morrisons", "merchant_id": "MID123", "marketplace_id": ""},
+        WorkItem(
+            store_name="Belle Vale Morrisons",
+            dropdown_name="Belle Vale",
+            merchant_id="",
+            marketplace_id="",
+        ),
         submission_queue,
         state,
     )
@@ -263,37 +315,131 @@ async def test_process_single_store_falls_back_to_ui_after_fast_path_failure(mon
     assert queued["store"] == "Belle Vale Morrisons"
     assert queued["orders"] == "8"
     assert state.run_failures == []
+    assert state.cache.api_url_template == "https://example.com/api/metrics?merchantIds%5B%5D={merchant_id}&endRange%5Bhour%5D=9"
+    assert state.cache.merchant_id_cache["Belle Vale Morrisons"] == "DISCOVERED"
+
+
+@pytest.mark.asyncio
+async def test_fast_path_worker_completes_without_creating_page():
+    state = ScraperState()
+    state.cache.api_url_template = "https://example.com/summationMetrics?merchantIds%5B%5D={merchant_id}"
+    state.concurrency_limit = 1
+
+    fast_path_queue = asyncio.Queue()
+    ui_queue = asyncio.Queue()
+    submission_queue = asyncio.Queue()
+    await fast_path_queue.put(
+        WorkItem(
+            store_name="Belle Vale Morrisons",
+            dropdown_name="Belle Vale",
+            merchant_id="MID123",
+            marketplace_id="",
+        )
+    )
+
+    browser = FakeBrowser(page=None, request_client=FakeRequestClient([200]))
+
+    await scraper.fast_path_worker_task(
+        worker_id=1,
+        browser=browser,
+        storage_template={"cookies": [{"name": "session"}]},
+        fast_path_queue=fast_path_queue,
+        ui_queue=ui_queue,
+        submission_queue=submission_queue,
+        state=state,
+    )
+
+    queued = await submission_queue.get()
+
+    assert queued["store"] == "Belle Vale Morrisons"
+    assert browser.created_contexts[0].new_page_calls == 0
+    assert ui_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_fast_path_worker_requeues_failed_store_once_for_ui():
+    state = ScraperState()
+    state.cache.api_url_template = "https://example.com/summationMetrics?merchantIds%5B%5D={merchant_id}"
+    state.concurrency_limit = 1
+
+    fast_path_queue = asyncio.Queue()
+    ui_queue = asyncio.Queue()
+    submission_queue = asyncio.Queue()
+    await fast_path_queue.put(
+        WorkItem(
+            store_name="Belle Vale Morrisons",
+            dropdown_name="Belle Vale",
+            merchant_id="MID123",
+            marketplace_id="",
+        )
+    )
+
+    browser = FakeBrowser(page=None, request_client=FakeRequestClient([500]))
+
+    await scraper.fast_path_worker_task(
+        worker_id=1,
+        browser=browser,
+        storage_template={"cookies": [{"name": "session"}]},
+        fast_path_queue=fast_path_queue,
+        ui_queue=ui_queue,
+        submission_queue=submission_queue,
+        state=state,
+    )
+
+    requeued = await ui_queue.get()
+
+    assert requeued.store_name == "Belle Vale Morrisons"
+    assert requeued.force_ui is True
+    assert state.requeued_from_fast_path == 1
+    assert submission_queue.empty()
     assert any(event["category"] == "api_fast_path" for event in state.failure_events)
 
 
 @pytest.mark.asyncio
-async def test_worker_task_continues_after_store_error_and_tolerates_cleanup_failures(monkeypatch):
+async def test_ui_worker_continues_after_store_error_and_tolerates_cleanup_failures(monkeypatch):
     processed: list[str] = []
 
-    async def fake_process_single_store(_page, store_item, _submission_queue, _state):
-        if store_item["store_name"] == "First Store":
+    async def fake_process_ui_store(_page, work_item, _submission_queue, _state):
+        if work_item.store_name == "First Store":
             raise RuntimeError("boom")
-        processed.append(store_item["store_name"])
+        processed.append(work_item.store_name)
 
-    monkeypatch.setattr(scraper, "process_single_store", fake_process_single_store)
+    monkeypatch.setattr(scraper, "process_ui_store", fake_process_ui_store)
 
     state = ScraperState()
     state.concurrency_limit = 1
 
-    job_queue = asyncio.Queue()
-    await job_queue.put({"store_name": "First Store"})
-    await job_queue.put({"store_name": "Second Store"})
+    ui_queue = asyncio.Queue()
+    await ui_queue.put(
+        WorkItem(
+            store_name="First Store",
+            dropdown_name="First Store",
+            merchant_id="",
+            marketplace_id="",
+        )
+    )
+    await ui_queue.put(
+        WorkItem(
+            store_name="Second Store",
+            dropdown_name="Second Store",
+            merchant_id="",
+            marketplace_id="",
+        )
+    )
 
     page = FakePage(fail_on_close=True)
-    browser = FakeBrowser(page, fail_on_context_close=True)
+    browser = FakeBrowser(page=page, fail_on_context_close=True)
     submission_queue = asyncio.Queue()
+    fast_path_done = asyncio.Event()
+    fast_path_done.set()
 
-    await scraper.worker_task(
+    await scraper.ui_worker_task(
         worker_id=1,
         browser=browser,
         storage_template={"cookies": [{"name": "session"}]},
-        job_queue=job_queue,
+        ui_queue=ui_queue,
         submission_queue=submission_queue,
+        fast_path_done=fast_path_done,
         state=state,
     )
 

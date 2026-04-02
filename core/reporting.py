@@ -249,6 +249,24 @@ def build_github_step_summary_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _summarize_timing_entries(entries: list[tuple[str, float]]) -> dict[str, object]:
+    if not entries:
+        return {
+            "count": 0,
+            "average_seconds": 0.0,
+            "p95_seconds": 0.0,
+        }
+
+    durations = sorted(duration for _store_name, duration in entries)
+    average_seconds = sum(durations) / len(durations)
+    p95_seconds = durations[int(len(durations) * 0.95)]
+    return {
+        "count": len(entries),
+        "average_seconds": round(average_seconds, 3),
+        "p95_seconds": round(p95_seconds, 3),
+    }
+
+
 def build_run_summary(state) -> dict[str, object]:
     finished_at = state.run_finished_at or datetime.now(state.run_started_at.tzinfo)
     started_at = state.run_started_at
@@ -257,6 +275,7 @@ def build_run_summary(state) -> dict[str, object]:
     failure_digest = build_failure_digest(state.failure_events)
 
     collection_times = state.metrics["collection_times"]
+    path_collection_times = state.metrics["path_collection_times"]
     submission_times = state.metrics["submission_times"]
 
     avg_collection_seconds = (
@@ -300,6 +319,11 @@ def build_run_summary(state) -> dict[str, object]:
             "browser_workers": state.browser_worker_pool_size or INITIAL_CONCURRENCY,
             "form_submitters": state.form_submitter_count or NUM_FORM_SUBMITTERS,
         },
+        "routing": {
+            "fast_path_eligible_at_start": state.fast_path_eligible_at_start,
+            "ui_routed_at_start": state.ui_routed_at_start,
+            "requeued_from_fast_path": state.requeued_from_fast_path,
+        },
         "stores": {
             "total": state.progress["total"],
             "successful_submissions": state.progress["current"],
@@ -342,6 +366,10 @@ def build_run_summary(state) -> dict[str, object]:
             "p95_seconds": round(p95_collection_seconds, 3),
             "fastest_store": _build_store_timing_summary(fastest_store),
             "slowest_store": _build_store_timing_summary(slowest_store),
+        },
+        "path_metrics": {
+            "fast_path": _summarize_timing_entries(path_collection_times.get("fast_path", [])),
+            "ui": _summarize_timing_entries(path_collection_times.get("ui", [])),
         },
         "submission_metrics": {
             "average_seconds": round(avg_submission_seconds, 3),

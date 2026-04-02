@@ -24,7 +24,9 @@ from core.logger import app_logger
 from core.metrics import build_form_data, normalize_metrics_payload
 from core.state import ScraperState
 from core.utils import normalize_name, save_screenshot
+from core.work_items import WorkItem
 
+METRICS_TIMEOUT = 45_000
 TRANSIENT_FAST_PATH_STATUSES = {503, 504}
 
 
@@ -252,7 +254,21 @@ async def _dump_dropdown_debug(page: Page, store_name: str):
         app_logger.warning(f"[{store_name}] Failed to save dropdown debug HTML: {exc}")
 
 
-async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str, state: ScraperState, timeout: int):
+def _build_fast_path_target_url(api_url_template: str, merchant_id: str) -> str:
+    detail_template = api_url_template.replace("/summationMetrics?", "/metrics?")
+    current_hour = datetime.now(LOCAL_TIMEZONE).hour
+    if "endRange%5Bhour%5D=" in detail_template:
+        detail_template = re.sub(r"endRange%5Bhour%5D=\d+", f"endRange%5Bhour%5D={current_hour}", detail_template)
+    return detail_template.replace("{merchant_id}", merchant_id)
+
+
+def build_store_submission(store_name: str, api_data: list[dict] | dict) -> tuple[dict[str, str], dict[str, float]]:
+    normalized_metrics = normalize_metrics_payload(api_data)
+    form_data = build_form_data(store_name, normalized_metrics)
+    return form_data, normalized_metrics
+
+
+async def fetch_metrics_fast_path(request_client, target_url: str, store_name: str, state: ScraperState, timeout: int):
     async with state.fast_path_semaphore:
         async with state.fast_path_lock:
             request_index = state.fast_path_started_count
@@ -267,7 +283,7 @@ async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str,
                 await asyncio.sleep(warmup_delay)
 
         for api_attempt in range(FAST_PATH_RETRY_COUNT):
-            resp = await page.context.request.get(target_url, timeout=timeout)
+            resp = await request_client.get(target_url, timeout=timeout)
             if resp.status == 200:
                 return await resp.json()
 
@@ -280,6 +296,10 @@ async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str,
                 continue
 
             raise Exception(f"API Fetch failed: {resp.status}")
+
+
+async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str, state: ScraperState, timeout: int):
+    return await fetch_metrics_fast_path(page.context.request, target_url, store_name, state, timeout)
 
 
 async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name: str):
@@ -337,88 +357,114 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
     raise TimeoutError(f"No dropdown option matched '{dropdown_name}'")
 
 
-async def process_single_store(
-    page: Page, store_info: dict[str, str], submission_queue: asyncio.Queue, state: ScraperState
+async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: ScraperState, timeout: int = METRICS_TIMEOUT):
+    store_name = work_item.store_name
+    dropdown_name = resolve_dropdown_name(work_item.dropdown_name)
+
+    dropdown_trigger = page.locator("#store-selector-dropdown")
+    if not page.url.startswith(BASE_DASHBOARD_URL) or not await dropdown_trigger.is_visible():
+        app_logger.info(f"[{store_name}] Dashboard trigger not visible or URL is wrong. Navigating...")
+        await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+
+    await select_store_from_dropdown(page, dropdown_name, store_name)
+
+    refresh_button = page.get_by_role("button", name="Refresh")
+    async with page.expect_response(
+        lambda r: any(k in r.url for k in ["summationMetrics", "api/metrics"]) and r.status == 200,
+        timeout=timeout,
+    ) as resp_info:
+        await expect(refresh_button).to_be_visible(timeout=WAIT_TIMEOUT)
+        await refresh_button.first.dispatch_event("click")
+
+    response = await resp_info.value
+    api_data = await response.json()
+
+    req_url = response.url
+    parsed = urllib.parse.urlparse(req_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    cache_updated = False
+
+    if "summationMetrics" in req_url or "api/metrics" in req_url:
+        generic_url = re.sub(r"merchantIds%5B%5D=[^&]*", "merchantIds%5B%5D={merchant_id}", req_url)
+        async with state.cache.lock:
+            if not state.cache.api_url_template:
+                state.cache.api_url_template = generic_url
+                cache_updated = True
+                app_logger.info(
+                    f"[{store_name}] Discovery: Captured API Template: {state.cache.api_url_template[:100]}..."
+                )
+
+    captured_mids = params.get("merchantIds[]") or params.get("merchantIds")
+    if captured_mids:
+        captured_mid = captured_mids[0]
+        work_item.merchant_id = captured_mid
+        async with state.cache.lock:
+            if state.cache.merchant_id_cache.get(store_name) != captured_mid:
+                state.cache.merchant_id_cache[store_name] = captured_mid
+                cache_updated = True
+                app_logger.info(f"[{store_name}] Discovery: Discovered internal Merchant ID: {captured_mid}")
+
+    if cache_updated:
+        await state.cache.save()
+
+    return api_data
+
+
+async def process_fast_path_store(
+    request_client,
+    work_item: WorkItem,
+    ui_queue: asyncio.Queue,
+    submission_queue: asyncio.Queue,
+    state: ScraperState,
 ):
     start_ts = asyncio.get_running_loop().time()
-    store_name = store_info["store_name"]
-    selection_store_name = store_info.get("dropdown_name") or store_name
-    dropdown_name = resolve_dropdown_name(selection_store_name)
+    store_name = work_item.store_name
 
-    merchant_id = store_info.get("merchant_id") or state.cache.merchant_id_cache.get(store_name)
-    METRICS_TIMEOUT = 45_000
+    try:
+        if not state.cache.api_url_template or not work_item.merchant_id:
+            raise RuntimeError("Fast-path route requires both an API template and a merchant ID")
+
+        target_url = _build_fast_path_target_url(state.cache.api_url_template, work_item.merchant_id)
+        api_data = await fetch_metrics_fast_path(request_client, target_url, store_name, state, METRICS_TIMEOUT)
+        app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
+
+        form_data, normalized_metrics = build_store_submission(store_name, api_data)
+        app_logger.info(f"[{store_name}] 'Late Picks' extracted from API JSON: {form_data['lates']}")
+        await submission_queue.put(form_data)
+
+        duration = asyncio.get_running_loop().time() - start_ts
+        await state.record_metric(
+            store_name,
+            duration,
+            int(normalized_metrics.get("OrdersShopped_V2", 0)),
+            int(normalized_metrics.get("RequestedQuantity_V2", 0)),
+            path="fast_path",
+        )
+        app_logger.info(f"[{store_name}] Data collection complete ({duration:.2f}s).")
+    except Exception as api_err:
+        app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Requeueing to UI.")
+        await state.record_issue(
+            f"{store_name} (API Fast Path Fallback)",
+            asyncio.get_running_loop().time(),
+            category="api_fast_path",
+        )
+        if not work_item.force_ui:
+            work_item.force_ui = True
+            await state.record_fast_path_requeue()
+            await ui_queue.put(work_item)
+
+
+async def process_ui_store(page: Page, work_item: WorkItem, submission_queue: asyncio.Queue, state: ScraperState):
+    start_ts = asyncio.get_running_loop().time()
+    store_name = work_item.store_name
 
     for attempt in range(WORKER_RETRY_COUNT):
-        current_stage = "general"
+        current_stage = "ui_fallback"
         try:
-            api_data = None
-            if state.cache.api_url_template and merchant_id:
-                current_stage = "api_fast_path"
-                try:
-                    detail_template = state.cache.api_url_template.replace("/summationMetrics?", "/metrics?")
-                    current_hour = datetime.now(LOCAL_TIMEZONE).hour
-                    detail_template = re.sub(
-                        r"endRange%5Bhour%5D=\d+", f"endRange%5Bhour%5D={current_hour}", detail_template
-                    )
-                    target_url = detail_template.replace("{merchant_id}", merchant_id)
-                    api_data = await _fetch_metrics_fast_path(page, target_url, store_name, state, METRICS_TIMEOUT)
-                    app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
-                except Exception as api_err:
-                    app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Falling back to UI.")
-                    await state.record_issue(
-                        f"{store_name} (API Fast Path Fallback)",
-                        asyncio.get_running_loop().time(),
-                        category="api_fast_path",
-                    )
-                    api_data = None
-
-            if not api_data:
-                current_stage = "ui_fallback"
-                dropdown_trigger = page.locator("#store-selector-dropdown")
-                if not page.url.startswith(BASE_DASHBOARD_URL) or not await dropdown_trigger.is_visible():
-                    app_logger.info(f"[{store_name}] Dashboard trigger not visible or URL is wrong. Navigating...")
-                    await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-
-                await select_store_from_dropdown(page, dropdown_name, store_name)
-
-                refresh_button = page.get_by_role("button", name="Refresh")
-                async with page.expect_response(
-                    lambda r: any(k in r.url for k in ["summationMetrics", "api/metrics"]) and r.status == 200,
-                    timeout=METRICS_TIMEOUT,
-                ) as resp_info:
-                    await expect(refresh_button).to_be_visible(timeout=WAIT_TIMEOUT)
-                    await refresh_button.first.dispatch_event("click")
-
-                response = await resp_info.value
-                api_data = await response.json()
-
-                req_url = response.url
-                parsed = urllib.parse.urlparse(req_url)
-                params = urllib.parse.parse_qs(parsed.query)
-
-                if ("summationMetrics" in req_url or "api/metrics" in req_url) and not state.cache.api_url_template:
-                    async with state.cache.lock:
-                        generic_url = re.sub(r"merchantIds%5B%5D=[^&]*", "merchantIds%5B%5D={merchant_id}", req_url)
-                        state.cache.api_url_template = generic_url
-                        app_logger.info(
-                            f"[{store_name}] Discovery: Captured API Template: {state.cache.api_url_template[:100]}..."
-                        )
-
-                captured_mids = params.get("merchantIds[]") or params.get("merchantIds")
-                if captured_mids and len(captured_mids) > 0:
-                    captured_mid = captured_mids[0]
-                    merchant_id = captured_mid
-
-                    if state.cache.merchant_id_cache.get(store_name) != captured_mid:
-                        async with state.cache.lock:
-                            state.cache.merchant_id_cache[store_name] = captured_mid
-                        app_logger.info(f"[{store_name}] Discovery: Discovered internal Merchant ID: {captured_mid}")
-
-                    await state.cache.save()
+            api_data = await collect_metrics_via_ui(page, work_item, state, timeout=METRICS_TIMEOUT)
 
             current_stage = "general"
-            data_to_use = normalize_metrics_payload(api_data)
-            form_data = build_form_data(store_name, data_to_use)
+            form_data, normalized_metrics = build_store_submission(store_name, api_data)
             app_logger.info(f"[{store_name}] 'Late Picks' extracted from API JSON: {form_data['lates']}")
             await submission_queue.put(form_data)
 
@@ -426,15 +472,15 @@ async def process_single_store(
             await state.record_metric(
                 store_name,
                 duration,
-                int(data_to_use.get("OrdersShopped_V2", 0)),
-                int(data_to_use.get("RequestedQuantity_V2", 0)),
+                int(normalized_metrics.get("OrdersShopped_V2", 0)),
+                int(normalized_metrics.get("RequestedQuantity_V2", 0)),
+                path="ui",
             )
 
             app_logger.info(f"[{store_name}] Data collection complete ({duration:.2f}s).")
             return
-
-        except Exception as e:
-            app_logger.warning(f"[{store_name}] Failed attempt {attempt + 1}: {e}")
+        except Exception as exc:
+            app_logger.warning(f"[{store_name}] Failed attempt {attempt + 1}: {exc}")
             if attempt < WORKER_RETRY_COUNT - 1:
                 await state.record_retry(store_name)
                 sleep_time = 2**attempt
@@ -446,7 +492,6 @@ async def process_single_store(
                 await asyncio.sleep(sleep_time)
             else:
                 failure_reason_by_stage = {
-                    "api_fast_path": "API Fast Path Failure",
                     "ui_fallback": "UI Fallback Failure",
                     "general": "Store Processing Failure",
                 }
@@ -456,3 +501,11 @@ async def process_single_store(
                     category=current_stage,
                 )
                 await save_screenshot(page, f"process_fail_{store_name}")
+
+
+async def process_single_store(
+    page: Page, store_info: dict[str, str], submission_queue: asyncio.Queue, state: ScraperState
+):
+    merchant_id = store_info.get("merchant_id") or state.cache.merchant_id_cache.get(store_info["store_name"], "")
+    work_item = WorkItem.from_store_info(store_info, merchant_id=merchant_id)
+    await process_ui_store(page, work_item, submission_queue, state)

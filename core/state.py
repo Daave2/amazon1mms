@@ -93,6 +93,9 @@ class ScraperState:
         self.live_dropdown_new_stores: list[str] = []
         self.live_dropdown_missing_stores: list[str] = []
         self.job_summary_posted = False
+        self.fast_path_eligible_at_start = 0
+        self.ui_routed_at_start = 0
+        self.requeued_from_fast_path = 0
 
         self.progress = {"current": 0, "total": 0, "lastUpdate": "N/A"}
         self.progress_lock = asyncio.Lock()
@@ -104,6 +107,10 @@ class ScraperState:
 
         self.metrics = {
             "collection_times": [],
+            "path_collection_times": {
+                "fast_path": [],
+                "ui": [],
+            },
             "submission_times": [],
             "retries": 0,
             "total_orders": 0,
@@ -168,9 +175,10 @@ class ScraperState:
                 }
             )
 
-    async def record_metric(self, store_name: str, duration: float, orders: int, units: int):
+    async def record_metric(self, store_name: str, duration: float, orders: int, units: int, path: str = "ui"):
         async with self.metrics_lock:
             self.metrics["collection_times"].append((store_name, duration))
+            self.metrics["path_collection_times"].setdefault(path, []).append((store_name, duration))
             self.metrics["total_orders"] += orders
             self.metrics["total_units"] += units
 
@@ -182,3 +190,7 @@ class ScraperState:
         async with self.metrics_lock:
             self.metrics["retries"] += 1
             self.metrics["retry_stores"].add(store_name)
+
+    async def record_fast_path_requeue(self):
+        async with self.metrics_lock:
+            self.requeued_from_fast_path += 1

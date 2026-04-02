@@ -17,6 +17,7 @@ from core.config import (
     CPU_LOWER_THRESHOLD,
     CPU_UPPER_THRESHOLD,
     DEBUG_MODE,
+    FAST_PATH_MAX_CONCURRENCY,
     INITIAL_CONCURRENCY,
     LOCAL_TIMEZONE,
     MEM_UPPER_THRESHOLD,
@@ -29,13 +30,15 @@ from core.reporting import write_runtime_reports
 from core.state import ScraperState
 from core.store_loader import load_stores_from_csv
 from core.utils import optimize_browser_context, safe_close
+from core.work_items import WorkItem
 from services.auth_service import check_if_login_needed, prime_master_session
 from services.chat_service import flush_pending_chat_entries, post_job_summary
 from services.forms_service import http_form_submitter_worker
 from services.metrics_service import (
     _selection_matches_target,
     discover_available_dropdown_stores,
-    process_single_store,
+    process_fast_path_store,
+    process_ui_store,
     resolve_dropdown_name,
 )
 
@@ -317,6 +320,45 @@ async def load_live_dropdown_stores(
     return filtered_stores
 
 
+def route_store_work_items(
+    urls_data: list[dict[str, str]],
+    state: ScraperState,
+) -> tuple[list[WorkItem], list[WorkItem]]:
+    fast_path_items: list[WorkItem] = []
+    ui_items: list[WorkItem] = []
+    fast_path_enabled = state.cache_template_available_at_start
+
+    for store in urls_data:
+        merchant_id = (store.get("merchant_id") or state.cache.merchant_id_cache.get(store["store_name"], "")).strip()
+        work_item = WorkItem.from_store_info(store, merchant_id=merchant_id)
+        if fast_path_enabled and merchant_id:
+            fast_path_items.append(work_item)
+        else:
+            ui_items.append(work_item)
+
+    state.fast_path_eligible_at_start = len(fast_path_items)
+    state.ui_routed_at_start = len(ui_items)
+    return fast_path_items, ui_items
+
+
+def allocate_worker_counts(fast_path_store_count: int, ui_store_count: int) -> tuple[int, int]:
+    api_workers = min(fast_path_store_count, FAST_PATH_MAX_CONCURRENCY, INITIAL_CONCURRENCY)
+
+    needs_ui_capacity = ui_store_count > 0 or fast_path_store_count > 0
+    if needs_ui_capacity:
+        remaining_budget = max(INITIAL_CONCURRENCY - api_workers, 0)
+        desired_ui_workers = ui_store_count or 1
+        ui_workers = min(desired_ui_workers, remaining_budget if remaining_budget > 0 else 1)
+    else:
+        ui_workers = 0
+
+    total_workers = api_workers + ui_workers
+    if total_workers > INITIAL_CONCURRENCY:
+        api_workers = max(INITIAL_CONCURRENCY - ui_workers, 0)
+
+    return api_workers, ui_workers
+
+
 async def auto_concurrency_manager(state: ScraperState):
     if not AUTO_ENABLED:
         return
@@ -377,15 +419,81 @@ async def auto_concurrency_manager(state: ScraperState):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def worker_task(
+async def _acquire_worker_slot(state: ScraperState):
+    async with state.concurrency_condition:
+        while state.active_workers_count >= state.concurrency_limit:
+            await state.concurrency_condition.wait()
+        state.active_workers_count += 1
+
+
+async def _release_worker_slot(state: ScraperState):
+    async with state.concurrency_condition:
+        state.active_workers_count -= 1
+        state.concurrency_condition.notify_all()
+
+
+async def fast_path_worker_task(
     worker_id: int,
     browser: Browser,
     storage_template: dict,
-    job_queue: asyncio.Queue,
+    fast_path_queue: asyncio.Queue,
+    ui_queue: asyncio.Queue,
     submission_queue: asyncio.Queue,
     state: ScraperState,
 ):
-    app_logger.info(f"[Worker-{worker_id}] Starting up.")
+    worker_label = f"FastPathWorker-{worker_id}"
+    app_logger.info(f"[{worker_label}] Starting up.")
+    context = None
+    try:
+        context = await browser.new_context(storage_state=storage_template)
+        context.set_default_navigation_timeout(PAGE_TIMEOUT)
+        context.set_default_timeout(ACTION_TIMEOUT)
+
+        while True:
+            try:
+                work_item = fast_path_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            await _acquire_worker_slot(state)
+            try:
+                await process_fast_path_store(context.request, work_item, ui_queue, submission_queue, state)
+            except Exception as exc:
+                app_logger.exception(
+                    f"[{worker_label}] Unhandled exception while processing {work_item.store_name}: {exc}"
+                )
+                await state.add_failure(
+                    f"{work_item.store_name} (Worker Exception)",
+                    asyncio.get_running_loop().time(),
+                    category="worker",
+                )
+            finally:
+                await _release_worker_slot(state)
+                fast_path_queue.task_done()
+
+    except Exception as exc:
+        app_logger.error(f"[{worker_label}] Crashed during setup: {exc}")
+        await state.add_failure(
+            f"{worker_label} (Worker Setup Exception)",
+            asyncio.get_running_loop().time(),
+            category="worker",
+        )
+    finally:
+        await safe_close(context, f"{worker_label} context", state.record_issue)
+        app_logger.info(f"[{worker_label}] Shutting down.")
+
+
+async def ui_worker_task(
+    worker_id: int,
+    browser: Browser,
+    storage_template: dict,
+    ui_queue: asyncio.Queue,
+    submission_queue: asyncio.Queue,
+    fast_path_done: asyncio.Event,
+    state: ScraperState,
+):
+    worker_label = f"UIWorker-{worker_id}"
+    app_logger.info(f"[{worker_label}] Starting up.")
     context = None
     page = None
     try:
@@ -393,54 +501,50 @@ async def worker_task(
         await optimize_browser_context(context)
         context.set_default_navigation_timeout(PAGE_TIMEOUT)
         context.set_default_timeout(ACTION_TIMEOUT)
-        page = await context.new_page()
 
         while True:
             try:
-                store_item = job_queue.get_nowait()
+                work_item = ui_queue.get_nowait()
             except asyncio.QueueEmpty:
-                break
+                if fast_path_done.is_set():
+                    break
+                await asyncio.sleep(0.1)
+                continue
 
-            async with state.concurrency_condition:
-                while state.active_workers_count >= state.concurrency_limit:
-                    await state.concurrency_condition.wait()
-                state.active_workers_count += 1
-
+            await _acquire_worker_slot(state)
             try:
-                await process_single_store(page, store_item, submission_queue, state)
+                if page is None or page.is_closed():
+                    page = await context.new_page()
+                await process_ui_store(page, work_item, submission_queue, state)
             except Exception as exc:
-                store_name = store_item.get("store_name", f"Worker-{worker_id}")
-                app_logger.exception(f"[Worker-{worker_id}] Unhandled exception while processing {store_name}: {exc}")
+                app_logger.exception(
+                    f"[{worker_label}] Unhandled exception while processing {work_item.store_name}: {exc}"
+                )
                 await state.add_failure(
-                    f"{store_name} (Worker Exception)",
+                    f"{work_item.store_name} (Worker Exception)",
                     asyncio.get_running_loop().time(),
                     category="worker",
                 )
             finally:
-                async with state.concurrency_condition:
-                    state.active_workers_count -= 1
-                    state.concurrency_condition.notify_all()
-                job_queue.task_done()
+                await _release_worker_slot(state)
+                ui_queue.task_done()
 
-    except Exception as e:
-        app_logger.error(f"[Worker-{worker_id}] Crashed during setup: {e}")
+    except Exception as exc:
+        app_logger.error(f"[{worker_label}] Crashed during setup: {exc}")
         await state.add_failure(
-            f"Worker-{worker_id} (Worker Setup Exception)",
+            f"{worker_label} (Worker Setup Exception)",
             asyncio.get_running_loop().time(),
             category="worker",
         )
     finally:
-        await safe_close(page, f"Worker-{worker_id} page", state.record_issue)
-        await safe_close(context, f"Worker-{worker_id} context", state.record_issue)
-        app_logger.info(f"[Worker-{worker_id}] Shutting down.")
+        await safe_close(page, f"{worker_label} page", state.record_issue)
+        await safe_close(context, f"{worker_label} context", state.record_issue)
+        app_logger.info(f"[{worker_label}] Shutting down.")
 
 
 async def process_urls(browser: Browser, state: ScraperState):
-    pool_size = INITIAL_CONCURRENCY
-    state.browser_worker_pool_size = pool_size
     state.form_submitter_count = NUM_FORM_SUBMITTERS
-    state.concurrency_limit = pool_size
-    app_logger.info(f"Job 'process_urls' started with Worker Pool size: {pool_size}")
+    app_logger.info(f"Job 'process_urls' started with worker budget: {INITIAL_CONCURRENCY}")
 
     urls_data = load_default_data(state)
     if not urls_data:
@@ -501,11 +605,30 @@ async def process_urls(browser: Browser, state: ScraperState):
         state.set_job_status("aborted_no_stores", "No configured stores were present in the live dropdown")
         return
 
-    job_queue = asyncio.Queue()
+    fast_path_items, ui_items = route_store_work_items(urls_data, state)
+    api_workers, ui_workers = allocate_worker_counts(len(fast_path_items), len(ui_items))
+    total_workers = api_workers + ui_workers
+    state.browser_worker_pool_size = total_workers
+    state.concurrency_limit = max(total_workers, 1)
+
+    app_logger.info(
+        "Routing stores for warm-cache run: "
+        f"{len(fast_path_items)} fast-path eligible, {len(ui_items)} queued for UI."
+    )
+    app_logger.info(
+        "Worker allocation: "
+        f"{api_workers} fast-path worker(s), {ui_workers} UI worker(s), "
+        f"{NUM_FORM_SUBMITTERS} form submitter(s)."
+    )
+
+    fast_path_queue = asyncio.Queue()
+    ui_queue = asyncio.Queue()
     submission_queue = asyncio.Queue()
 
-    for store in urls_data:
-        job_queue.put_nowait(store)
+    for work_item in fast_path_items:
+        fast_path_queue.put_nowait(work_item)
+    for work_item in ui_items:
+        ui_queue.put_nowait(work_item)
 
     await state.init_progress(len(urls_data))
     start_time = datetime.now(LOCAL_TIMEZONE)
@@ -516,16 +639,46 @@ async def process_urls(browser: Browser, state: ScraperState):
         for i in range(NUM_FORM_SUBMITTERS)
     ]
 
-    app_logger.info(f"Spinning up {pool_size} browser workers...")
-    workers = [
-        asyncio.create_task(worker_task(i + 1, browser, storage_template, job_queue, submission_queue, state))
-        for i in range(pool_size)
+    fast_path_done = asyncio.Event()
+    if api_workers == 0:
+        fast_path_done.set()
+
+    app_logger.info(f"Spinning up {total_workers} browser worker(s)...")
+    fast_path_workers = [
+        asyncio.create_task(
+            fast_path_worker_task(
+                i + 1,
+                browser,
+                storage_template,
+                fast_path_queue,
+                ui_queue,
+                submission_queue,
+                state,
+            )
+        )
+        for i in range(api_workers)
+    ]
+    ui_workers_tasks = [
+        asyncio.create_task(
+            ui_worker_task(
+                i + 1,
+                browser,
+                storage_template,
+                ui_queue,
+                submission_queue,
+                fast_path_done,
+                state,
+            )
+        )
+        for i in range(ui_workers)
     ]
 
     # Auto-concurrency task
     auto_task = asyncio.create_task(auto_concurrency_manager(state))
 
-    await asyncio.gather(*workers)
+    await asyncio.gather(*fast_path_workers)
+    fast_path_done.set()
+    await asyncio.gather(*ui_workers_tasks)
 
     app_logger.info("All workers finished. Waiting for submission queue to empty...")
     await submission_queue.join()

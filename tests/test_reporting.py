@@ -15,9 +15,16 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     state.cache_merchant_ids_at_start = 4
     state.browser_worker_pool_size = 5
     state.form_submitter_count = 2
+    state.fast_path_eligible_at_start = 1
+    state.ui_routed_at_start = 1
+    state.requeued_from_fast_path = 1
     state.progress["total"] = 2
     state.progress["current"] = 2
     state.metrics["collection_times"] = [("Belle Vale Morrisons", 1.4), ("Carterton Morrisons", 2.2)]
+    state.metrics["path_collection_times"] = {
+        "fast_path": [("Belle Vale Morrisons", 1.4)],
+        "ui": [("Carterton Morrisons", 2.2)],
+    }
     state.metrics["submission_times"] = [("Belle Vale Morrisons", 0.4), ("Carterton Morrisons", 0.5)]
     state.metrics["retries"] = 1
     state.metrics["retry_stores"].add("Belle Vale Morrisons")
@@ -34,9 +41,18 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     assert summary["stores"]["successful_submissions"] == 2
     assert summary["discovery_cache"]["template_available_at_start"] is True
     assert summary["discovery"]["live_dropdown_stores"] == 2
+    assert summary["routing"] == {
+        "fast_path_eligible_at_start": 1,
+        "ui_routed_at_start": 1,
+        "requeued_from_fast_path": 1,
+    }
     assert summary["collection_metrics"]["fastest_store"] == {
         "store": "Belle Vale Morrisons",
         "seconds": 1.4,
+    }
+    assert summary["path_metrics"] == {
+        "fast_path": {"count": 1, "average_seconds": 1.4, "p95_seconds": 1.4},
+        "ui": {"count": 1, "average_seconds": 2.2, "p95_seconds": 2.2},
     }
 
     with open(tmp_path / "run_summary.json", encoding="utf-8") as file_handle:
