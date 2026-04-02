@@ -28,7 +28,7 @@ from core.logger import app_logger
 from core.reporting import write_runtime_reports
 from core.state import ScraperState
 from core.store_loader import load_stores_from_csv
-from core.utils import safe_close
+from core.utils import optimize_browser_context, safe_close
 from services.auth_service import check_if_login_needed, prime_master_session
 from services.chat_service import flush_pending_chat_entries, post_job_summary
 from services.forms_service import http_form_submitter_worker
@@ -215,10 +215,11 @@ async def load_live_dropdown_stores(
     try:
         app_logger.info("Discovering live store list from the dashboard dropdown before queueing stores.")
         context = await browser.new_context(storage_state=storage_template)
+        await optimize_browser_context(context)
         context.set_default_navigation_timeout(PAGE_TIMEOUT)
         context.set_default_timeout(ACTION_TIMEOUT)
         page = await context.new_page()
-        await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="networkidle")
+        await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
 
         available_stores = await discover_available_dropdown_stores(page)
         filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
@@ -329,6 +330,7 @@ async def worker_task(
     page = None
     try:
         context = await browser.new_context(storage_state=storage_template)
+        await optimize_browser_context(context)
         context.set_default_navigation_timeout(PAGE_TIMEOUT)
         context.set_default_timeout(ACTION_TIMEOUT)
         page = await context.new_page()
@@ -394,6 +396,7 @@ async def process_urls(browser: Browser, state: ScraperState):
             with open(STORAGE_STATE) as f:
                 storage_for_check = json.load(f)
             temp_context = await browser.new_context(storage_state=storage_for_check)
+            await optimize_browser_context(temp_context)
             temp_page = await temp_context.new_page()
             if not await check_if_login_needed(temp_page, BASE_DASHBOARD_URL):
                 app_logger.info("Session verification successful. Skipping login.")

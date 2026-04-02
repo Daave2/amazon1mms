@@ -17,7 +17,7 @@ from core.config import (
     STORAGE_STATE,
 )
 from core.logger import app_logger
-from core.utils import safe_close, save_screenshot
+from core.utils import optimize_browser_context, safe_close, save_screenshot
 
 
 async def check_if_login_needed(page: Page, test_url: str) -> bool:
@@ -186,16 +186,9 @@ async def prime_master_session(browser) -> bool:
         if not browser or not browser.is_connected():
             return False
         ctx = await browser.new_context()
+        await optimize_browser_context(ctx)
         ctx.set_default_navigation_timeout(PAGE_TIMEOUT)
         ctx.set_default_timeout(ACTION_TIMEOUT)
-        await ctx.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in ("image", "stylesheet", "font", "media")
-                else route.continue_()
-            ),
-        )
         page = await ctx.new_page()
         if not await perform_login_and_otp(page):
             return False

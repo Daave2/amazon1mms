@@ -377,7 +377,7 @@ async def process_single_store(
                 dropdown_trigger = page.locator("#store-selector-dropdown")
                 if not page.url.startswith(BASE_DASHBOARD_URL) or not await dropdown_trigger.is_visible():
                     app_logger.info(f"[{store_name}] Dashboard trigger not visible or URL is wrong. Navigating...")
-                    await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="networkidle")
+                    await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
 
                 await select_store_from_dropdown(page, dropdown_name, store_name)
 

@@ -1,8 +1,11 @@
 import asyncio
 import re
+from urllib.parse import urlparse
 
-from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, STORE_PREFIX_RE
+from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, RESOURCE_BLOCKLIST, STORE_PREFIX_RE
 from core.logger import app_logger
+
+BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 
 def normalize_name(name: str) -> str:
@@ -48,6 +51,22 @@ async def save_screenshot(page, prefix: str):
         app_logger.info(f"Screenshot saved for debugging: {path}")
     except Exception as e:
         app_logger.error(f"Failed to save screenshot with prefix '{prefix}': {e}")
+
+
+async def optimize_browser_context(context):
+    route_method = getattr(context, "route", None)
+    if not callable(route_method):
+        return
+
+    async def route_handler(route):
+        request = route.request
+        hostname = urlparse(request.url).netloc.lower()
+        if request.resource_type in BLOCKED_RESOURCE_TYPES or any(domain in hostname for domain in RESOURCE_BLOCKLIST):
+            await route.abort()
+            return
+        await route.continue_()
+
+    await route_method("**/*", route_handler)
 
 
 async def safe_close(resource, label: str, failure_recorder=None):

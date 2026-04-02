@@ -47,9 +47,9 @@ class Settings(BaseSettings):
     wait_timeout_ms: int = Field(default=15000)
     action_timeout_ms: int = Field(default=15000)
     worker_retry_count: int = Field(default=1)
-    fast_path_max_concurrency: int = Field(default=6)
-    fast_path_warmup_requests: int = Field(default=8)
-    fast_path_warmup_delay_ms: int = Field(default=350)
+    fast_path_max_concurrency: int = Field(default=12)
+    fast_path_warmup_requests: int = Field(default=4)
+    fast_path_warmup_delay_ms: int = Field(default=150)
     fast_path_retry_count: int = Field(default=3)
     fast_path_retry_base_delay_ms: int = Field(default=1500)
 
