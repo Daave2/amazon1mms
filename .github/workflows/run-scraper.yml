@@ -109,8 +109,8 @@ jobs:
       CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
       TARGET_URL: ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
       FORM_POST_URL: ${{ secrets.FORM_POST_URL || 'https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse' }}
-      AUTO_MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || 40 }}
-      INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || 25 }}
+      AUTO_MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || 50 }}
+      INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || 50 }}
       NUM_FORM_SUBMITTERS: ${{ secrets.NUM_SUBMITTERS || 5 }}
       FORCE_DROPDOWN_DISCOVERY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.refresh_dropdown == 'true' && 'true' || 'false' }}
 
