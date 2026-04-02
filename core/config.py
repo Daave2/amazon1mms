@@ -85,7 +85,7 @@ class Settings:
     page_timeout_ms: int = 30000
     wait_timeout_ms: int = 15000
     action_timeout_ms: int = 15000
-    worker_retry_count: int = 1
+    worker_retry_count: int = 3
     fast_path_max_concurrency: int = 12
     fast_path_warmup_requests: int = 4
     fast_path_warmup_delay_ms: int = 150
@@ -218,7 +218,7 @@ def load_settings(env_file: str | None = None) -> Settings:
             page_timeout_ms=_parse_int(_get_env_value(env_values, "PAGE_TIMEOUT"), 30000),
             wait_timeout_ms=_parse_int(_get_env_value(env_values, "WAIT_TIMEOUT"), 15000),
             action_timeout_ms=_parse_int(_get_env_value(env_values, "ACTION_TIMEOUT"), 15000),
-            worker_retry_count=_parse_int(_get_env_value(env_values, "WORKER_RETRY_COUNT"), 1),
+            worker_retry_count=_parse_int(_get_env_value(env_values, "WORKER_RETRY_COUNT"), 3),
             fast_path_max_concurrency=_parse_int(_get_env_value(env_values, "FAST_PATH_MAX_CONCURRENCY"), 12),
             fast_path_warmup_requests=_parse_int(_get_env_value(env_values, "FAST_PATH_WARMUP_REQUESTS"), 4),
             fast_path_warmup_delay_ms=_parse_int(_get_env_value(env_values, "FAST_PATH_WARMUP_DELAY_MS"), 150),

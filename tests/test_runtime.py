@@ -273,6 +273,25 @@ def test_route_store_work_items_disables_fast_path_routing_when_template_missing
     assert state.ui_routed_at_start == 2
 
 
+def test_route_store_work_items_recovers_cached_merchant_id_from_dropdown_alias():
+    state = ScraperState()
+    state.cache_template_available_at_start = True
+    state.cache.merchant_id_cache["Jarrow Morrisons"] = "MID-JARROW"
+
+    fast_path_items, ui_items = scraper.route_store_work_items(
+        [
+            {"store_name": "Jarrow", "dropdown_name": "Jarrow", "merchant_id": "", "marketplace_id": ""},
+        ],
+        state,
+    )
+
+    assert [item.store_name for item in fast_path_items] == ["Jarrow"]
+    assert [item.merchant_id for item in fast_path_items] == ["MID-JARROW"]
+    assert ui_items == []
+    assert state.fast_path_eligible_at_start == 1
+    assert state.ui_routed_at_start == 0
+
+
 def test_should_bypass_auto_concurrency_for_all_fast_path_warm_cache_run():
     state = ScraperState()
     state.fast_path_eligible_at_start = 85

@@ -152,7 +152,56 @@ def filter_stores_to_live_dropdown(
         if configured_store["_index"] not in matched_configured_indices
     ]
 
+    queue_stores, skipped_stores = _reconcile_unmatched_filtered_stores(queue_stores, skipped_stores, settings)
+
     return queue_stores, skipped_stores
+
+
+def _reconcile_unmatched_filtered_stores(
+    filtered_stores: list[dict[str, str]],
+    skipped_stores: list[dict[str, str]],
+    settings: Settings,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    remaining_skipped = list(skipped_stores)
+
+    for filtered_store in filtered_stores:
+        if filtered_store.get("matched_from_configured"):
+            continue
+
+        live_name = filtered_store["store_name"]
+        dropdown_name = filtered_store.get("dropdown_name", live_name)
+        live_merchant_id = filtered_store.get("merchant_id", "").strip()
+
+        merchant_candidates = [
+            candidate
+            for candidate in remaining_skipped
+            if live_merchant_id and candidate.get("merchant_id", "").strip() == live_merchant_id
+        ]
+        if len(merchant_candidates) == 1:
+            matched_store = merchant_candidates[0]
+        else:
+            name_candidates = [
+                candidate
+                for candidate in remaining_skipped
+                if _selection_matches_target(live_name, dropdown_name, candidate["store_name"], settings)
+            ]
+            exact_candidates = [
+                candidate
+                for candidate in name_candidates
+                if resolve_dropdown_name(candidate["store_name"], settings) == resolve_dropdown_name(dropdown_name, settings)
+            ]
+            matched_store = exact_candidates[0] if len(exact_candidates) == 1 else (name_candidates[0] if len(name_candidates) == 1 else None)
+
+        if not matched_store:
+            continue
+
+        filtered_store["store_name"] = matched_store["store_name"]
+        filtered_store["merchant_id"] = filtered_store.get("merchant_id", "").strip() or matched_store.get("merchant_id", "").strip()
+        filtered_store["marketplace_id"] = matched_store.get("marketplace_id", "").strip()
+        filtered_store["matched_from_configured"] = True
+        remaining_skipped.remove(matched_store)
+
+    return filtered_stores, remaining_skipped
 
 
 def _match_configured_store_for_live_option(
@@ -401,7 +450,7 @@ def route_store_work_items(
     fast_path_enabled = state.cache_template_available_at_start
 
     for store in urls_data:
-        merchant_id = (store.get("merchant_id") or state.cache.merchant_id_cache.get(store["store_name"], "")).strip()
+        merchant_id = _resolve_store_merchant_id(store, state)
         work_item = WorkItem.from_store_info(store, merchant_id=merchant_id)
         if fast_path_enabled and merchant_id:
             fast_path_items.append(work_item)
@@ -411,6 +460,30 @@ def route_store_work_items(
     state.fast_path_eligible_at_start = len(fast_path_items)
     state.ui_routed_at_start = len(ui_items)
     return fast_path_items, ui_items
+
+
+def _resolve_store_merchant_id(store: dict[str, str], state: ScraperState) -> str:
+    merchant_id = (store.get("merchant_id") or "").strip()
+    if merchant_id:
+        return merchant_id
+
+    cache = state.cache.merchant_id_cache
+    store_name = store["store_name"]
+    if store_name in cache and cache[store_name].strip():
+        return cache[store_name].strip()
+
+    target_names = {
+        resolve_dropdown_name(store_name, state.settings),
+        resolve_dropdown_name(store.get("dropdown_name", store_name), state.settings),
+    }
+    for cached_store_name, cached_merchant_id in cache.items():
+        if not cached_merchant_id.strip():
+            continue
+        cached_normalized = resolve_dropdown_name(cached_store_name, state.settings)
+        if cached_normalized in target_names:
+            return cached_merchant_id.strip()
+
+    return ""
 
 
 def allocate_worker_counts(

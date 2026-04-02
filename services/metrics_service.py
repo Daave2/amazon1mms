@@ -250,6 +250,24 @@ async def _select_option_with_keyboard(
     return False
 
 
+async def _select_option_without_search_input(
+    page: Page,
+    dropdown_name: str,
+    store_name: str,
+    settings: Settings,
+) -> bool:
+    for search_term in _build_search_terms(dropdown_name, store_name):
+        try:
+            if await _select_option_via_overlay_text(page, search_term, store_name, settings):
+                selected_text = await _current_store_selector_text(page)
+                if _selection_matches_target(selected_text, dropdown_name, store_name, settings):
+                    app_logger.info(f"[{store_name}] Store selected from dropdown without search input.")
+                    return True
+        except Exception as exc:
+            app_logger.debug(f"[{store_name}] Direct option selection failed for '{search_term}': {exc}")
+    return False
+
+
 async def _dump_dropdown_debug(page: Page, store_name: str, settings: Settings):
     try:
         overlay = await _visible_dropdown_overlay(page)
@@ -352,14 +370,21 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
     )
     try:
         await expect(search_input.first).to_be_visible(timeout=20000)
-    except TimeoutError:
+    except Exception:
         app_logger.info(f"[{store_name}] Search input not found, attempting to find any visible dropdown-related input.")
         search_input = page.locator(
             'input:visible:not(#katal-id-0, [placeholder*="shoppers" i]), .dropdown-list-container input'
         ).first
-        if not await search_input.is_visible():
+        try:
+            if not await search_input.is_visible():
+                app_logger.warning(f"[{store_name}] No search input found at all. Proceeding to direct option selection.")
+                search_input = None
+        except Exception:
             app_logger.warning(f"[{store_name}] No search input found at all. Proceeding to direct option selection.")
             search_input = None
+
+    if search_input is None and await _select_option_without_search_input(page, dropdown_name, store_name, settings):
+        return True
 
     if search_input:
         await search_input.first.click()
