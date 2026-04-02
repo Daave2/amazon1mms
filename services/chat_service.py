@@ -21,7 +21,7 @@ from core.reporting import (
     build_run_summary,
 )
 from core.state import ScraperState
-from core.utils import format_metric_with_emoji, sanitize_store_name
+from core.utils import sanitize_store_name
 
 CARD_IMAGE_URL = "https://i.imgur.com/u0e3d2x.png"
 
@@ -75,25 +75,140 @@ def _format_html_lines(lines: list[str]) -> str:
     return "<br>".join(escape(line) for line in lines)
 
 
-def _build_batch_attention_lines(entries: list[dict[str, str]]) -> list[str]:
-    lines: list[str] = []
+def _pluralize(word: str, count: int) -> str:
+    return word if count == 1 else f"{word}s"
+
+
+def _collect_metric_rows(entries: list[dict[str, str]], field: str) -> list[dict[str, object]]:
+    metric_rows: list[dict[str, object]] = []
     for entry in entries:
-        issues: list[str] = []
-        uph_value = _extract_numeric_value(entry.get("uph"))
-        lates_value = _extract_numeric_value(entry.get("lates"))
-        inf_value = _extract_numeric_value(entry.get("inf"))
+        numeric_value = _extract_numeric_value(entry.get(field))
+        if numeric_value is None:
+            continue
 
-        if uph_value is not None and uph_value < UPH_THRESHOLD:
-            issues.append(f"UPH {entry.get('uph', 'N/A')}")
-        if lates_value is not None and lates_value > LATES_THRESHOLD:
-            issues.append(f"Lates {entry.get('lates', 'N/A')}")
-        if inf_value is not None and inf_value > INF_THRESHOLD:
-            issues.append(f"INF {entry.get('inf', 'N/A')}")
+        metric_rows.append(
+            {
+                "store": sanitize_store_name(entry.get("store", "Unknown")),
+                "value": numeric_value,
+            }
+        )
+    return metric_rows
 
-        if issues:
-            lines.append(f"{sanitize_store_name(entry.get('store', 'Unknown'))}: {', '.join(issues)}")
 
-    return lines
+def _describe_target_position(value: float, threshold: float, higher_is_better: bool) -> str:
+    if higher_is_better:
+        delta = value - threshold
+        if delta >= 0:
+            if delta < 2:
+                return "just above target"
+            if delta < 8:
+                return "above target"
+            return "well above target"
+        if abs(delta) < 2:
+            return "just below target"
+        if abs(delta) < 8:
+            return "below target"
+        return "well below target"
+
+    delta = threshold - value
+    if delta >= 0:
+        if delta < 0.25:
+            return "just inside target"
+        if delta < 1.0:
+            return "inside target"
+        return "well inside target"
+    if abs(delta) < 0.5:
+        return "just above target"
+    if abs(delta) < 2.0:
+        return "above target"
+    return "well above target"
+
+
+def _format_ranked_metric_line(
+    label: str,
+    metric_rows: list[dict[str, object]],
+    descending: bool,
+    suffix: str = "",
+    zero_is_all_clear: bool = False,
+) -> str:
+    if not metric_rows:
+        return f"{label}: no data"
+
+    sorted_rows = sorted(
+        metric_rows,
+        key=lambda row: (-float(row["value"]), str(row["store"])) if descending else (float(row["value"]), str(row["store"])),
+    )
+
+    if zero_is_all_clear and all(float(row["value"]) == 0.0 for row in sorted_rows):
+        return f"{label}: all stores at 0.0{suffix}"
+
+    worst_rows = sorted_rows[:3]
+    formatted_rows = ", ".join(
+        f"{row['store']} ({float(row['value']):.1f}{suffix})"
+        for row in worst_rows
+    )
+    return f"{label}: {formatted_rows}"
+
+
+def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
+    uph_rows = _collect_metric_rows(entries, "uph")
+    lates_rows = _collect_metric_rows(entries, "lates")
+    inf_rows = _collect_metric_rows(entries, "inf")
+
+    summary_lines: list[str] = []
+
+    if uph_rows:
+        avg_uph = sum(float(row["value"]) for row in uph_rows) / len(uph_rows)
+        below_target = sum(float(row["value"]) < UPH_THRESHOLD for row in uph_rows)
+        lowest_uph = min(uph_rows, key=lambda row: (float(row["value"]), str(row["store"])))
+        if below_target:
+            uph_tail = (
+                f"{below_target} {_pluralize('store', below_target)} below target, "
+                f"with {lowest_uph['store']} lowest at {float(lowest_uph['value']):.1f}"
+            )
+        else:
+            uph_tail = (
+                f"all stores at or above target, with {lowest_uph['store']} still lowest at "
+                f"{float(lowest_uph['value']):.1f}"
+            )
+        summary_lines.append(
+            f"UPH averaged {avg_uph:.1f} batch-wide, "
+            f"{_describe_target_position(avg_uph, UPH_THRESHOLD, higher_is_better=True)} versus the {UPH_THRESHOLD} target, with {uph_tail}."
+        )
+
+    if lates_rows:
+        avg_lates = sum(float(row["value"]) for row in lates_rows) / len(lates_rows)
+        above_target = sum(float(row["value"]) > LATES_THRESHOLD for row in lates_rows)
+        zero_lates = sum(float(row["value"]) == 0.0 for row in lates_rows)
+        highest_lates = max(lates_rows, key=lambda row: (float(row["value"]), str(row["store"])))
+        lates_mid = (
+            f"{above_target} {_pluralize('store', above_target)} over target"
+            if above_target
+            else "no stores over target"
+        )
+        summary_lines.append(
+            f"Lates averaged {avg_lates:.1f}% batch-wide, "
+            f"{_describe_target_position(avg_lates, LATES_THRESHOLD, higher_is_better=False)} versus the {LATES_THRESHOLD:.1f}% target, "
+            f"with {lates_mid} and {zero_lates} at 0.0%; highest was {highest_lates['store']} at {float(highest_lates['value']):.1f}%."
+        )
+
+    if inf_rows:
+        avg_inf = sum(float(row["value"]) for row in inf_rows) / len(inf_rows)
+        above_target = sum(float(row["value"]) > INF_THRESHOLD for row in inf_rows)
+        zero_inf = sum(float(row["value"]) == 0.0 for row in inf_rows)
+        highest_inf = max(inf_rows, key=lambda row: (float(row["value"]), str(row["store"])))
+        inf_mid = (
+            f"{above_target} {_pluralize('store', above_target)} over target"
+            if above_target
+            else "no stores over target"
+        )
+        summary_lines.append(
+            f"INF averaged {avg_inf:.1f}% batch-wide, "
+            f"{_describe_target_position(avg_inf, INF_THRESHOLD, higher_is_better=False)} versus the {INF_THRESHOLD:.1f}% target, "
+            f"with {inf_mid} and {zero_inf} at 0.0%; highest was {highest_inf['store']} at {float(highest_inf['value']):.1f}%."
+        )
+
+    return summary_lines
 
 
 def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState) -> dict[str, object]:
@@ -101,45 +216,44 @@ def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState)
     card_subtitle = f"{batch_header_text} • Batch {state.chat_batch_count} • {len(entries)} stores"
 
     sorted_entries = sorted(entries, key=lambda entry: sanitize_store_name(entry.get("store", "")))
-    attention_lines = _build_batch_attention_lines(sorted_entries)
-
-    grid_items = [
-        {"title": "Store", "textAlignment": "START"},
-        {"title": "UPH", "textAlignment": "CENTER"},
-        {"title": "Lates", "textAlignment": "CENTER"},
-        {"title": "INF", "textAlignment": "CENTER"},
+    uph_rows = _collect_metric_rows(sorted_entries, "uph")
+    lates_rows = _collect_metric_rows(sorted_entries, "lates")
+    inf_rows = _collect_metric_rows(sorted_entries, "inf")
+    stores_needing_attention = len(
+        {
+            row["store"]
+            for row in uph_rows
+            if float(row["value"]) < UPH_THRESHOLD
+        }
+        | {
+            row["store"]
+            for row in lates_rows
+            if float(row["value"]) > LATES_THRESHOLD
+        }
+        | {
+            row["store"]
+            for row in inf_rows
+            if float(row["value"]) > INF_THRESHOLD
+        }
+    )
+    summary_lines = _build_batch_summary_lines(sorted_entries)
+    outlier_lines = [
+        _format_ranked_metric_line("Lowest UPH", uph_rows, descending=False),
+        _format_ranked_metric_line("Highest Lates", lates_rows, descending=True, suffix="%", zero_is_all_clear=True),
+        _format_ranked_metric_line("Highest INF", inf_rows, descending=True, suffix="%", zero_is_all_clear=True),
     ]
-
-    for entry in sorted_entries:
-        uph_val = entry.get("uph", "N/A")
-        lates_val = entry.get("lates", "0.0 %") or "0.0 %"
-        inf_val = entry.get("inf", "0.0 %") or "0.0 %"
-
-        grid_items.extend(
-            [
-                {
-                    "title": sanitize_store_name(entry.get("store", "N/A")),
-                    "textAlignment": "START",
-                },
-                {
-                    "title": format_metric_with_emoji(uph_val, UPH_THRESHOLD, is_uph=True),
-                    "textAlignment": "CENTER",
-                },
-                {
-                    "title": format_metric_with_emoji(lates_val, LATES_THRESHOLD),
-                    "textAlignment": "CENTER",
-                },
-                {
-                    "title": format_metric_with_emoji(inf_val, INF_THRESHOLD),
-                    "textAlignment": "CENTER",
-                },
-            ]
-        )
 
     sections = [
         {
             "header": "Batch Overview",
             "widgets": [
+                {
+                    "decoratedText": {
+                        "topLabel": "Stores In Batch",
+                        "text": str(len(sorted_entries)),
+                        "startIcon": {"knownIcon": "STORE"},
+                    }
+                },
                 {
                     "decoratedText": {
                         "topLabel": "Average UPH",
@@ -164,43 +278,33 @@ def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState)
                 {
                     "decoratedText": {
                         "topLabel": "Stores Needing Attention",
-                        "text": str(len(attention_lines)),
+                        "text": str(stores_needing_attention),
                         "startIcon": {"knownIcon": "STORE"},
                     }
                 },
             ],
         },
         {
-            "header": "Store Metrics",
+            "header": "Batch Summary",
             "widgets": [
                 {
-                    "grid": {
-                        "title": "Performance Snapshot",
-                        "columnCount": 4,
-                        "borderStyle": {"type": "STROKE", "cornerRadius": 4},
-                        "items": grid_items,
+                    "textParagraph": {
+                        "text": _format_html_lines(summary_lines or ["No batch summary available."]),
+                    }
+                }
+            ],
+        },
+        {
+            "header": "Metric Outliers",
+            "widgets": [
+                {
+                    "textParagraph": {
+                        "text": _format_html_lines(outlier_lines),
                     }
                 }
             ],
         },
     ]
-
-    if attention_lines:
-        visible_lines = attention_lines[:6]
-        if len(attention_lines) > len(visible_lines):
-            visible_lines.append(f"...and {len(attention_lines) - len(visible_lines)} more")
-        sections.append(
-            {
-                "header": "Attention Needed",
-                "widgets": [
-                    {
-                        "textParagraph": {
-                            "text": _format_html_lines(visible_lines),
-                        }
-                    }
-                ],
-            }
-        )
 
     return {
         "cardsV2": [
