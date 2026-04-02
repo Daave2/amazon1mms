@@ -17,14 +17,18 @@ class FakeRequestResponse:
 
 
 class FakeRequestClient:
+    def __init__(self, responses=None):
+        self.responses = list(responses or [500])
+
     async def get(self, _url, timeout):
         assert timeout == 45_000
-        return FakeRequestResponse(500)
+        status = self.responses.pop(0) if self.responses else 500
+        return FakeRequestResponse(status, {"metrics": {"OrdersShopped_V2": 8}})
 
 
 class FakeContext:
-    def __init__(self, page, fail_on_close=False):
-        self.request = FakeRequestClient()
+    def __init__(self, page, fail_on_close=False, request_client=None):
+        self.request = request_client or FakeRequestClient()
         self._page = page
         self.fail_on_close = fail_on_close
 
@@ -128,15 +132,42 @@ class FakePage:
 
 
 class FakeBrowser:
-    def __init__(self, page, fail_on_context_close=False):
+    def __init__(self, page, fail_on_context_close=False, request_client=None):
         self._page = page
         self.fail_on_context_close = fail_on_context_close
+        self.request_client = request_client
 
     async def new_context(self, storage_state):
         assert storage_state == {"cookies": [{"name": "session"}]}
-        context = FakeContext(self._page, fail_on_close=self.fail_on_context_close)
+        context = FakeContext(
+            self._page,
+            fail_on_close=self.fail_on_context_close,
+            request_client=self.request_client,
+        )
         self._page.context = context
         return context
+
+
+@pytest.mark.asyncio
+async def test_fast_path_retries_transient_503_then_succeeds(monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
+
+    page = FakePage()
+    page.context = FakeContext(page, request_client=FakeRequestClient([503, 200]))
+    state = ScraperState()
+
+    payload = await metrics_service._fetch_metrics_fast_path(
+        page,
+        "https://example.com/metrics?merchantIds%5B%5D=MID123",
+        "Belle Vale Morrisons",
+        state,
+        45_000,
+    )
+
+    assert payload["metrics"]["OrdersShopped_V2"] == 8
 
 
 @pytest.mark.asyncio

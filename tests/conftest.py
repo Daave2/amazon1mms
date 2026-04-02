@@ -9,6 +9,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+PYTEST_ARTIFACTS_DIR = PROJECT_ROOT / ".pytest_artifacts"
+PYTEST_OUTPUT_DIR = PYTEST_ARTIFACTS_DIR / "output"
+
 os.environ.setdefault("LOGIN_URL", "https://example.com/signin")
 os.environ.setdefault("LOGIN_EMAIL", "tester@example.com")
 os.environ.setdefault("LOGIN_PASSWORD", "password")
@@ -41,6 +44,11 @@ config_stub.PAGE_TIMEOUT = 30_000
 config_stub.WAIT_TIMEOUT = 15_000
 config_stub.ACTION_TIMEOUT = 15_000
 config_stub.WORKER_RETRY_COUNT = 1
+config_stub.FAST_PATH_MAX_CONCURRENCY = 6
+config_stub.FAST_PATH_WARMUP_REQUESTS = 8
+config_stub.FAST_PATH_WARMUP_DELAY_MS = 350
+config_stub.FAST_PATH_RETRY_COUNT = 3
+config_stub.FAST_PATH_RETRY_BASE_DELAY_MS = 1500
 config_stub.STORE_PREFIX_RE = re.compile(r"^morrisons?\s*-?\s*|\s*-?\s*morrisons?$", re.I)
 config_stub.SPECIAL_NAME_MAPPINGS = {
     "analby": "anlaby",
@@ -73,11 +81,11 @@ config_stub.FIELD_MAP = {
     "field_11": "entry.extra",
     "time_available": "entry.time_available",
 }
-config_stub.OUTPUT_DIR = "output"
-config_stub.LOG_FILE = "output/submissions.log"
-config_stub.JSON_LOG_FILE = "output/submissions.jsonl"
+config_stub.OUTPUT_DIR = str(PYTEST_OUTPUT_DIR)
+config_stub.LOG_FILE = str(PYTEST_OUTPUT_DIR / "submissions.log")
+config_stub.JSON_LOG_FILE = str(PYTEST_OUTPUT_DIR / "submissions.jsonl")
 config_stub.STORAGE_STATE = "state.json"
-config_stub.DISCOVERY_CACHE_FILE = "output/discovery_cache.json"
+config_stub.DISCOVERY_CACHE_FILE = str(PYTEST_OUTPUT_DIR / "discovery_cache.json")
 config_stub.RESOURCE_BLOCKLIST = []
 
 sys.modules.setdefault("core.config", config_stub)

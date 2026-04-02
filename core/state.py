@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime
 
-from core.config import DISCOVERY_CACHE_FILE, LOCAL_TIMEZONE
+from core.config import DISCOVERY_CACHE_FILE, FAST_PATH_MAX_CONCURRENCY, LOCAL_TIMEZONE
 from core.logger import app_logger
 
 
@@ -94,6 +94,9 @@ class ScraperState:
         self.active_workers_count = 0
         self.concurrency_condition = asyncio.Condition()
         self.last_concurrency_change = 0.0
+        self.fast_path_semaphore = asyncio.Semaphore(FAST_PATH_MAX_CONCURRENCY)
+        self.fast_path_lock = asyncio.Lock()
+        self.fast_path_started_count = 0
 
         self.cache = CacheManager()
 

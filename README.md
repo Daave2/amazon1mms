@@ -256,6 +256,11 @@ Browser investigation scripts in `scripts/debug/` are manual probes, are not par
 | `FORM_POST_URL` | No | Google Forms endpoint that receives normalized store rows | bundled default |
 | `INITIAL_CONCURRENCY` | No | Initial number of browser workers | `30` |
 | `NUM_FORM_SUBMITTERS` | No | Number of submission workers for Google Forms | `2` |
+| `FAST_PATH_MAX_CONCURRENCY` | No | Separate concurrency cap for direct metrics API calls | `6` |
+| `FAST_PATH_WARMUP_REQUESTS` | No | Number of initial fast-path calls to stagger during startup | `8` |
+| `FAST_PATH_WARMUP_DELAY_MS` | No | Extra delay added between early fast-path calls | `350` |
+| `FAST_PATH_RETRY_COUNT` | No | Number of fast-path retries for transient API failures | `3` |
+| `FAST_PATH_RETRY_BASE_DELAY_MS` | No | Base backoff used for transient `503`/`504` fast-path retries | `1500` |
 | `AUTO_ENABLED` | No | Enable automatic concurrency adjustment | `true` |
 | `AUTO_MIN_CONCURRENCY` | No | Minimum allowed active browser workers | `1` |
 | `AUTO_MAX_CONCURRENCY` | No | Maximum allowed active browser workers | `40` |

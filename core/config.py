@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     wait_timeout_ms: int = Field(default=15000)
     action_timeout_ms: int = Field(default=15000)
     worker_retry_count: int = Field(default=1)
+    fast_path_max_concurrency: int = Field(default=6)
+    fast_path_warmup_requests: int = Field(default=8)
+    fast_path_warmup_delay_ms: int = Field(default=350)
+    fast_path_retry_count: int = Field(default=3)
+    fast_path_retry_base_delay_ms: int = Field(default=1500)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -88,6 +93,11 @@ PAGE_TIMEOUT = settings.page_timeout_ms
 WAIT_TIMEOUT = settings.wait_timeout_ms
 ACTION_TIMEOUT = settings.action_timeout_ms
 WORKER_RETRY_COUNT = settings.worker_retry_count
+FAST_PATH_MAX_CONCURRENCY = settings.fast_path_max_concurrency
+FAST_PATH_WARMUP_REQUESTS = settings.fast_path_warmup_requests
+FAST_PATH_WARMUP_DELAY_MS = settings.fast_path_warmup_delay_ms
+FAST_PATH_RETRY_COUNT = settings.fast_path_retry_count
+FAST_PATH_RETRY_BASE_DELAY_MS = settings.fast_path_retry_base_delay_ms
 
 STORE_PREFIX_RE = re.compile(r"^morrisons?\s*-?\s*|\s*-?\s*morrisons?$", re.I)
 SPECIAL_NAME_MAPPINGS = {

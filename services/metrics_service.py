@@ -1,4 +1,6 @@
 import asyncio
+import difflib
+import os
 import re
 import urllib.parse
 from datetime import datetime
@@ -7,7 +9,12 @@ from playwright.async_api import Page, TimeoutError, expect
 
 from core.config import (
     BASE_DASHBOARD_URL,
+    FAST_PATH_RETRY_BASE_DELAY_MS,
+    FAST_PATH_RETRY_COUNT,
+    FAST_PATH_WARMUP_DELAY_MS,
+    FAST_PATH_WARMUP_REQUESTS,
     LOCAL_TIMEZONE,
+    OUTPUT_DIR,
     PAGE_TIMEOUT,
     SPECIAL_NAME_MAPPINGS,
     WAIT_TIMEOUT,
@@ -17,6 +24,187 @@ from core.logger import app_logger
 from core.metrics import build_form_data, normalize_metrics_payload
 from core.state import ScraperState
 from core.utils import normalize_name, save_screenshot
+
+TRANSIENT_FAST_PATH_STATUSES = {503, 504}
+
+
+def _build_search_terms(dropdown_name: str, store_name: str) -> list[str]:
+    raw_terms = [
+        dropdown_name,
+        dropdown_name.replace("-", " "),
+        dropdown_name.replace(" ", "-"),
+        normalize_name(store_name),
+        store_name,
+        re.sub(r"(?i)\s*morrisons?$", "", store_name).strip(),
+        re.sub(r"(?i)^morrisons?\s*", "", store_name).strip(),
+    ]
+
+    search_terms: list[str] = []
+    seen: set[str] = set()
+    for term in raw_terms:
+        cleaned_term = re.sub(r"\s+", " ", term).strip()
+        if not cleaned_term:
+            continue
+        key = cleaned_term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        search_terms.append(cleaned_term)
+    return search_terms
+
+
+def _selection_matches_target(selected_text: str, dropdown_name: str, store_name: str) -> bool:
+    selected_norm = normalize_name(selected_text)
+    candidate_norms = {normalize_name(dropdown_name), normalize_name(store_name)}
+
+    for candidate in candidate_norms:
+        if not candidate:
+            continue
+        if candidate in selected_norm or selected_norm in candidate:
+            return True
+        if difflib.SequenceMatcher(None, selected_norm, candidate).ratio() >= 0.72:
+            return True
+    return False
+
+
+async def _visible_dropdown_overlay(page: Page):
+    selectors = [
+        "kat-popover:visible",
+        "kat-dropdown-menu:visible",
+        "[role='listbox']:visible",
+        ".dropdown-content:visible",
+        ".dropdown-popover:visible",
+        ".dropdown-list:visible",
+    ]
+    for selector in selectors:
+        overlay = page.locator(selector).first
+        try:
+            if await overlay.is_visible():
+                return overlay
+        except Exception:
+            continue
+    return None
+
+
+async def _current_store_selector_text(page: Page) -> str:
+    selectors = [
+        "#store-selector-dropdown",
+        "#store-selector-input",
+        "kat-dropdown",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.is_visible():
+                text = await locator.text_content()
+                if text and text.strip():
+                    return text.strip()
+        except Exception:
+            continue
+    return ""
+
+
+async def _select_option_via_overlay_text(page: Page, search_term: str, store_name: str):
+    overlay = await _visible_dropdown_overlay(page)
+    if overlay is None:
+        return False
+
+    option_locator = overlay.get_by_text(search_term, exact=False).first
+    if await option_locator.is_visible():
+        selected_text = await option_locator.text_content()
+        app_logger.info(f"[{store_name}] Clicking dropdown option: '{selected_text.strip()}'")
+        await option_locator.click()
+        return True
+
+    overlay_texts = await overlay.locator("*").all_text_contents()
+    candidate_texts: list[str] = []
+    seen: set[str] = set()
+    for text in overlay_texts:
+        for part in re.split(r"[\n\r]+", text):
+            cleaned = re.sub(r"\s+", " ", part).strip()
+            if len(cleaned) < 3:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidate_texts.append(cleaned)
+
+    target_norm = normalize_name(search_term)
+    normalized_map = {normalize_name(text): text for text in candidate_texts if normalize_name(text)}
+    matches = difflib.get_close_matches(target_norm, list(normalized_map.keys()), n=1, cutoff=0.55)
+    if not matches:
+        return False
+
+    matched_option = normalized_map[matches[0]]
+    app_logger.info(f"[{store_name}] Fuzzy match found: '{search_term}' -> '{matched_option}'")
+    option_locator = overlay.get_by_text(matched_option, exact=False).first
+    if await option_locator.is_visible():
+        selected_text = await option_locator.text_content()
+        app_logger.info(f"[{store_name}] Clicking dropdown option: '{selected_text.strip()}'")
+        await option_locator.click()
+        return True
+
+    return False
+
+
+async def _select_option_with_keyboard(page: Page, search_input, dropdown_name: str, store_name: str):
+    await search_input.press("ArrowDown")
+    await search_input.press("Enter")
+    await asyncio.sleep(1)
+
+    selected_text = await _current_store_selector_text(page)
+    if _selection_matches_target(selected_text, dropdown_name, store_name):
+        app_logger.info(f"[{store_name}] Selected via keyboard fallback: '{selected_text}'")
+        return True
+    return False
+
+
+async def _dump_dropdown_debug(page: Page, store_name: str):
+    try:
+        overlay = await _visible_dropdown_overlay(page)
+        if overlay is None:
+            return
+
+        os.makedirs(os.path.join(OUTPUT_DIR, "debug"), exist_ok=True)
+        safe_name = re.sub(r'[\\/*?:"<>|]', "_", store_name)
+        debug_path = os.path.join(OUTPUT_DIR, "debug", f"dropdown_{safe_name}.html")
+        html = await overlay.inner_html()
+        with open(debug_path, "w", encoding="utf-8") as file_handle:
+            file_handle.write(html)
+        app_logger.info(f"[{store_name}] Saved dropdown debug HTML to {debug_path}")
+    except Exception as exc:
+        app_logger.warning(f"[{store_name}] Failed to save dropdown debug HTML: {exc}")
+
+
+async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str, state: ScraperState, timeout: int):
+    async with state.fast_path_semaphore:
+        async with state.fast_path_lock:
+            request_index = state.fast_path_started_count
+            state.fast_path_started_count += 1
+
+        if request_index < FAST_PATH_WARMUP_REQUESTS:
+            warmup_delay = (request_index * FAST_PATH_WARMUP_DELAY_MS) / 1000
+            if warmup_delay > 0:
+                app_logger.info(
+                    f"[{store_name}] Fast Path warm-up delay {warmup_delay:.2f}s before initial API request."
+                )
+                await asyncio.sleep(warmup_delay)
+
+        for api_attempt in range(FAST_PATH_RETRY_COUNT):
+            resp = await page.context.request.get(target_url, timeout=timeout)
+            if resp.status == 200:
+                return await resp.json()
+
+            if resp.status in TRANSIENT_FAST_PATH_STATUSES and api_attempt < FAST_PATH_RETRY_COUNT - 1:
+                delay_seconds = (FAST_PATH_RETRY_BASE_DELAY_MS / 1000) * (2**api_attempt)
+                app_logger.warning(
+                    f"[{store_name}] API returned {resp.status}. Retrying in {delay_seconds:.1f}s..."
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
+            raise Exception(f"API Fetch failed: {resp.status}")
 
 
 async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name: str):
@@ -54,40 +242,36 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
 
     if search_input:
         await search_input.first.click()
-        await search_input.first.fill(dropdown_name)
-        await asyncio.sleep(2)
+    search_terms = _build_search_terms(dropdown_name, store_name)
+    for index, search_term in enumerate(search_terms):
+        if search_input:
+            await search_input.first.fill(search_term)
+            await asyncio.sleep(1.5)
 
-    try:
-        option_locator = page.get_by_text(dropdown_name, exact=False).first
-        if not await option_locator.is_visible():
-            app_logger.info(
-                f"[{store_name}] No direct match for '{dropdown_name}'. Attempting fuzzy normalized match..."
-            )
-            options = page.locator('.dropdown-option, [role="option"], kat-option, .kat-option')
-            all_options = await options.all_text_contents()
-            if all_options:
-                import difflib
+        try:
+            if await _select_option_via_overlay_text(page, search_term, store_name):
+                selected_text = await _current_store_selector_text(page)
+                if _selection_matches_target(selected_text, dropdown_name, store_name):
+                    app_logger.info(f"[{store_name}] Store selected from dropdown.")
+                    return True
+        except Exception as exc:
+            app_logger.debug(f"[{store_name}] Text-based option selection failed for '{search_term}': {exc}")
 
-                target_norm = normalize_name(dropdown_name)
-                norm_map = {normalize_name(opt): opt for opt in all_options}
-                matches = difflib.get_close_matches(target_norm, list(norm_map.keys()), n=1, cutoff=0.3)
-                if matches:
-                    matched_option = norm_map[matches[0]]
-                    app_logger.info(f"[{store_name}] Fuzzy match found: '{dropdown_name}' -> '{matched_option}'")
-                    option_locator = options.filter(has_text=re.compile(re.escape(matched_option), re.I)).first
+        if search_input:
+            try:
+                if await _select_option_with_keyboard(page, search_input.first, dropdown_name, store_name):
+                    app_logger.info(f"[{store_name}] Store selected from dropdown.")
+                    return True
+            except Exception as exc:
+                app_logger.debug(f"[{store_name}] Keyboard fallback failed for '{search_term}': {exc}")
 
-        await expect(option_locator).to_be_visible(timeout=5000)
-        selected_text = await option_locator.text_content()
-        app_logger.info(f"[{store_name}] Clicking dropdown option: '{selected_text.strip()}'")
-        await option_locator.click()
-    except TimeoutError:
-        app_logger.warning(
-            f"[{store_name}] No dropdown options appeared or matched for '{dropdown_name}' after search."
-        )
-        raise
+        if index < len(search_terms) - 1:
+            await dropdown_trigger.first.click(force=True)
+            await asyncio.sleep(0.5)
 
-    app_logger.info(f"[{store_name}] Store selected from dropdown.")
-    return True
+    await _dump_dropdown_debug(page, store_name)
+    app_logger.warning(f"[{store_name}] No dropdown options appeared or matched for '{dropdown_name}' after search.")
+    raise TimeoutError(f"No dropdown option matched '{dropdown_name}'")
 
 
 async def process_single_store(
@@ -119,19 +303,8 @@ async def process_single_store(
                         r"endRange%5Bhour%5D=\d+", f"endRange%5Bhour%5D={current_hour}", detail_template
                     )
                     target_url = detail_template.replace("{merchant_id}", merchant_id)
-
-                    for api_attempt in range(2):
-                        resp = await page.context.request.get(target_url, timeout=METRICS_TIMEOUT)
-                        if resp.status == 200:
-                            api_data = await resp.json()
-                            app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
-                            break
-                        elif resp.status == 504 and api_attempt == 0:
-                            app_logger.warning(f"[{store_name}] API returned 504. Retrying in 2s...")
-                            await asyncio.sleep(2)
-                            continue
-                        else:
-                            raise Exception(f"API Fetch failed: {resp.status}")
+                    api_data = await _fetch_metrics_fast_path(page, target_url, store_name, state, METRICS_TIMEOUT)
+                    app_logger.info(f"[{store_name}] API Data fetched successfully (Fast Path).")
                 except Exception as api_err:
                     app_logger.warning(f"[{store_name}] Fast Path failed: {api_err}. Falling back to UI.")
                     await state.record_issue(
