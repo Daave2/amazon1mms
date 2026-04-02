@@ -1,59 +1,91 @@
+from __future__ import annotations
+
 import asyncio
+import json
+import os
 import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
-from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, RESOURCE_BLOCKLIST, STORE_PREFIX_RE
+from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, STORE_PREFIX_RE, Settings
 from core.logger import app_logger
 
 BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
 def normalize_name(name: str) -> str:
-    # 1. Lowercase and remove 'Morrisons'
-    n = name.lower().replace("morrisons", "")
-    # 2. Replace common separators with spaces
-    n = re.sub(r"[-_\.]", " ", n)
-    # 3. Trim extra whitespace
-    return n.strip()
+    normalized = name.lower().replace("morrisons", "")
+    normalized = re.sub(r"[-_\.]", " ", normalized)
+    return normalized.strip()
 
 
 def sanitize_store_name(name: str) -> str:
-    """Trim 'Morrisons' prefix or suffix from store names for chat display."""
     return STORE_PREFIX_RE.sub("", name).strip()
 
 
-def format_metric_with_emoji(value_str: str, threshold: float, is_uph: bool = False) -> str:
-    """Applies a pass/fail emoji to a metric string based on a threshold."""
+def format_metric_with_emoji(
+    value_str: str,
+    threshold: float,
+    is_uph: bool = False,
+    pass_emoji: str = EMOJI_GREEN_CHECK,
+    fail_emoji: str = EMOJI_RED_CROSS,
+) -> str:
     try:
         numeric_value = float(re.sub(r"[^\d.]", "", value_str))
-        is_good = (numeric_value >= threshold) if is_uph else (numeric_value <= threshold)
-        emoji = EMOJI_GREEN_CHECK if is_good else EMOJI_RED_CROSS
-        return f"{emoji} {value_str}"
-    except (ValueError, TypeError):
-        return value_str  # Return as is if not a number
+        is_good = numeric_value >= threshold if is_uph else numeric_value <= threshold
+        return f"{pass_emoji if is_good else fail_emoji} {value_str}"
+    except (TypeError, ValueError):
+        return value_str
 
 
-async def save_screenshot(page, prefix: str):
-    import os
-    import re
-    from datetime import datetime
+def ensure_directory(path: str):
+    Path(path).mkdir(parents=True, exist_ok=True)
 
-    from core.config import LOCAL_TIMEZONE, OUTPUT_DIR
 
+def atomic_write_text(path: str, content: str, encoding: str = "utf-8"):
+    directory = Path(path).parent
+    ensure_directory(str(directory))
+    handle = None
+    tmp_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile("w", encoding=encoding, dir=directory, delete=False)
+        tmp_path = handle.name
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(tmp_path, path)
+    finally:
+        if handle is not None:
+            handle.close()
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def atomic_write_json(path: str, payload: object, *, indent: int = 2):
+    atomic_write_text(path, json.dumps(payload, indent=indent), encoding="utf-8")
+
+
+async def save_screenshot(page, prefix: str, settings: Settings):
     if not page or page.is_closed():
-        app_logger.warning(f"Cannot save screenshot '{prefix}': Page is closed or unavailable.")
+        app_logger.warning(f"Cannot save screenshot '{prefix}': page is closed or unavailable.")
         return
+
     try:
         safe_prefix = re.sub(r'[\\/*?:"<>|]', "_", prefix)
-        timestamp = datetime.now(LOCAL_TIMEZONE).strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(OUTPUT_DIR, f"{safe_prefix}_{timestamp}.png")
+        timestamp = datetime.now(settings.local_timezone).strftime("%Y%m%d_%H%M%S")
+        path = settings.output_path(f"{safe_prefix}_{timestamp}.png")
+        ensure_directory(settings.output_dir)
         await page.screenshot(path=path, full_page=True, timeout=15000)
         app_logger.info(f"Screenshot saved for debugging: {path}")
-    except Exception as e:
-        app_logger.error(f"Failed to save screenshot with prefix '{prefix}': {e}")
+    except Exception as exc:
+        app_logger.error(f"Failed to save screenshot with prefix '{prefix}': {exc}")
 
 
-async def optimize_browser_context(context):
+async def optimize_browser_context(context, settings: Settings):
     route_method = getattr(context, "route", None)
     if not callable(route_method):
         return
@@ -61,7 +93,9 @@ async def optimize_browser_context(context):
     async def route_handler(route):
         request = route.request
         hostname = urlparse(request.url).netloc.lower()
-        if request.resource_type in BLOCKED_RESOURCE_TYPES or any(domain in hostname for domain in RESOURCE_BLOCKLIST):
+        if request.resource_type in BLOCKED_RESOURCE_TYPES or any(
+            domain in hostname for domain in settings.resource_blocklist
+        ):
             await route.abort()
             return
         await route.continue_()

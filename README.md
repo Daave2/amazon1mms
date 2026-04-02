@@ -120,6 +120,7 @@ flowchart LR
 
 - `output/submissions.log`: CSV log of successful downstream submissions
 - `output/submissions.jsonl`: JSONL log of successful downstream submissions
+- `output/submission_events.jsonl`: durable submission ledger used to replay queued or retryable submissions on the next run
 - `output/run_summary.json`: machine-readable final run summary with status, timings, retries, auth/cache state, and failure breakdowns
 - `output/failure_events.json`: ordered list of runtime issues and terminal failures with categories and timestamps
 - `app.log`: rotating application log for detailed execution traces and stack traces
@@ -198,7 +199,7 @@ You do not need `config.json` for `scraper.py`.
 2. Install Playwright Chromium:
 
    ```bash
-   python -m playwright install chromium
+   python3 -m playwright install chromium
    ```
 
 3. Create a local environment file:
@@ -208,17 +209,18 @@ You do not need `config.json` for `scraper.py`.
    ```
 
 4. Fill in the required Amazon credentials and runtime settings in `.env`.
+   `FORM_POST_URL` is now required and must point at the Google Form endpoint for this environment.
 
 5. Run the same preflight used by CI:
 
    ```bash
-   python scripts/preflight.py
+   python3 scripts/preflight.py
    ```
 
 6. Run the scraper:
 
    ```bash
-   python scraper.py
+   python3 scraper.py
    ```
 
 ## Testing
@@ -246,13 +248,13 @@ pytest -q tests/test_runtime.py
 Run the same lightweight validation used in CI:
 
 ```bash
-python -m compileall scraper.py core services scripts
+python3 -m compileall scraper.py core services scripts
 pytest --cov=. --cov-report=term-missing:skip-covered -q
 ```
 
 The automated test suite only collects files under `tests/`.
 Browser investigation scripts in `scripts/debug/` are manual probes, are not part of `pytest`, and may require a valid `.env` plus `state.json`.
-`python scripts/preflight.py` is the required preflight entrypoint for both local runs and GitHub Actions.
+`python3 scripts/preflight.py` is the required preflight entrypoint for both local runs and GitHub Actions.
 
 ## Environment Variables
 
@@ -266,12 +268,12 @@ Browser investigation scripts in `scripts/debug/` are manual probes, are not par
 | `TARGET_URL` | No | Dashboard landing page used for session verification and navigation | Seller Central 1MMS dashboard URL |
 | `CHAT_WEBHOOK_URL` | No | Google Chat webhook for KPI and summary cards | empty |
 | `CHAT_BATCH_SIZE` | No | Number of successful store rows to batch into each Google Chat card | `100` |
-| `FORM_POST_URL` | No | Google Forms endpoint that receives normalized store rows | bundled default |
+| `FORM_POST_URL` | Yes | Google Forms endpoint that receives normalized store rows | none |
 | `INITIAL_CONCURRENCY` | No | Initial number of browser workers | `30` |
 | `NUM_FORM_SUBMITTERS` | No | Number of submission workers for Google Forms | `2` |
-| `FAST_PATH_MAX_CONCURRENCY` | No | Separate concurrency cap for direct metrics API calls | `6` |
-| `FAST_PATH_WARMUP_REQUESTS` | No | Number of initial fast-path calls to stagger during startup | `8` |
-| `FAST_PATH_WARMUP_DELAY_MS` | No | Extra delay added between early fast-path calls | `350` |
+| `FAST_PATH_MAX_CONCURRENCY` | No | Separate concurrency cap for direct metrics API calls | `12` |
+| `FAST_PATH_WARMUP_REQUESTS` | No | Number of initial fast-path calls to stagger during startup | `4` |
+| `FAST_PATH_WARMUP_DELAY_MS` | No | Extra delay added between early fast-path calls | `150` |
 | `FAST_PATH_RETRY_COUNT` | No | Number of fast-path retries for transient API failures | `3` |
 | `FAST_PATH_RETRY_BASE_DELAY_MS` | No | Base backoff used for transient `503`/`504` fast-path retries | `1500` |
 | `AUTO_ENABLED` | No | Enable automatic concurrency adjustment | `true` |
@@ -290,9 +292,9 @@ The workflow also:
 
 - installs Python dependencies
 - restores cached discovery data and prior auth state from GitHub artifacts
-- runs `python scripts/preflight.py`
+- runs `python3 scripts/preflight.py`
 - installs Playwright only after preflight succeeds
-- runs `python scraper.py`
+- runs `python3 scraper.py`
 - publishes a GitHub step summary from `output/run_summary.json`
 - uploads logs, screenshots, discovery cache, auth state, and the runtime JSON reports back to GitHub artifacts
 
@@ -329,7 +331,7 @@ Use the GitHub Actions step summary as the first-stop overview for a run. If tha
 
 | Symptom | First action |
 | --- | --- |
-| Preflight error | Fix the reported environment, concurrency, output-path, or `urls.csv` problem and rerun `python scripts/preflight.py` before retrying the workflow. |
+| Preflight error | Fix the reported environment, concurrency, output-path, or `urls.csv` problem and rerun `python3 scripts/preflight.py` before retrying the workflow. |
 | `login_aborted` | Check Amazon credentials, `OTP_SECRET_KEY`, and any account picker or login flow changes. |
 | `completed_with_failures` | Open `output/run_summary.json` and inspect `failure_summary` plus `recent_failures` before drilling into logs. |
 | `fatal` | Start with `app.log`, then inspect `output/failure_events.json` for the last recorded issues before the exception. |

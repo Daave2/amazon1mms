@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Mapping
 from zoneinfo import ZoneInfo
@@ -6,6 +8,8 @@ LOCAL_TIMEZONE = ZoneInfo("Europe/London")
 
 LOG_FIELDNAMES = [
     "timestamp",
+    "run_id",
+    "submission_id",
     "date",
     "store",
     "orders",

@@ -95,8 +95,9 @@ def build_form_data(
     store_name: str,
     normalized_metrics: dict[str, float],
     current_dt: datetime | None = None,
+    local_timezone: ZoneInfo = LOCAL_TIMEZONE,
 ) -> dict[str, str]:
-    current_date = (current_dt or datetime.now(LOCAL_TIMEZONE)).strftime("%Y-%m-%d")
+    current_date = (current_dt or datetime.now(local_timezone)).strftime("%Y-%m-%d")
     lates_val = normalized_metrics.get("LatePicksRate", 0.0)
 
     return {

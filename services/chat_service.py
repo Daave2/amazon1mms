@@ -1,3 +1,4 @@
+import asyncio
 import re
 import ssl
 from datetime import datetime
@@ -6,15 +7,7 @@ from html import escape
 import aiohttp
 import certifi
 
-from core.config import (
-    CHAT_BATCH_SIZE,
-    CHAT_WEBHOOK_URL,
-    DEBUG_MODE,
-    INF_THRESHOLD,
-    LATES_THRESHOLD,
-    LOCAL_TIMEZONE,
-    UPH_THRESHOLD,
-)
+from core.config import Settings, load_settings
 from core.logger import app_logger
 from core.reporting import (
     build_dropdown_change_lines,
@@ -151,7 +144,7 @@ def _format_ranked_metric_line(
     return f"{label}: {formatted_rows}"
 
 
-def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
+def _build_batch_summary_lines(entries: list[dict[str, str]], settings: Settings) -> list[str]:
     uph_rows = _collect_metric_rows(entries, "uph")
     lates_rows = _collect_metric_rows(entries, "lates")
     inf_rows = _collect_metric_rows(entries, "inf")
@@ -160,7 +153,7 @@ def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
 
     if uph_rows:
         avg_uph = sum(float(row["value"]) for row in uph_rows) / len(uph_rows)
-        below_target = sum(float(row["value"]) < UPH_THRESHOLD for row in uph_rows)
+        below_target = sum(float(row["value"]) < settings.uph_threshold for row in uph_rows)
         lowest_uph = min(uph_rows, key=lambda row: (float(row["value"]), str(row["store"])))
         if below_target:
             uph_tail = (
@@ -174,12 +167,12 @@ def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
             )
         summary_lines.append(
             f"UPH averaged {avg_uph:.1f} batch-wide, "
-            f"{_describe_target_position(avg_uph, UPH_THRESHOLD, higher_is_better=True)} versus the {UPH_THRESHOLD} target, with {uph_tail}."
+            f"{_describe_target_position(avg_uph, settings.uph_threshold, higher_is_better=True)} versus the {settings.uph_threshold:.0f} target, with {uph_tail}."
         )
 
     if lates_rows:
         avg_lates = sum(float(row["value"]) for row in lates_rows) / len(lates_rows)
-        above_target = sum(float(row["value"]) > LATES_THRESHOLD for row in lates_rows)
+        above_target = sum(float(row["value"]) > settings.lates_threshold for row in lates_rows)
         zero_lates = sum(float(row["value"]) == 0.0 for row in lates_rows)
         highest_lates = max(lates_rows, key=lambda row: (float(row["value"]), str(row["store"])))
         lates_mid = (
@@ -189,13 +182,13 @@ def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
         )
         summary_lines.append(
             f"Lates averaged {avg_lates:.1f}% batch-wide, "
-            f"{_describe_target_position(avg_lates, LATES_THRESHOLD, higher_is_better=False)} versus the {LATES_THRESHOLD:.1f}% target, "
+            f"{_describe_target_position(avg_lates, settings.lates_threshold, higher_is_better=False)} versus the {settings.lates_threshold:.1f}% target, "
             f"with {lates_mid} and {zero_lates} at 0.0%; highest was {highest_lates['store']} at {float(highest_lates['value']):.1f}%."
         )
 
     if inf_rows:
         avg_inf = sum(float(row["value"]) for row in inf_rows) / len(inf_rows)
-        above_target = sum(float(row["value"]) > INF_THRESHOLD for row in inf_rows)
+        above_target = sum(float(row["value"]) > settings.inf_threshold for row in inf_rows)
         zero_inf = sum(float(row["value"]) == 0.0 for row in inf_rows)
         highest_inf = max(inf_rows, key=lambda row: (float(row["value"]), str(row["store"])))
         inf_mid = (
@@ -205,7 +198,7 @@ def _build_batch_summary_lines(entries: list[dict[str, str]]) -> list[str]:
         )
         summary_lines.append(
             f"INF averaged {avg_inf:.1f}% batch-wide, "
-            f"{_describe_target_position(avg_inf, INF_THRESHOLD, higher_is_better=False)} versus the {INF_THRESHOLD:.1f}% target, "
+            f"{_describe_target_position(avg_inf, settings.inf_threshold, higher_is_better=False)} versus the {settings.inf_threshold:.1f}% target, "
             f"with {inf_mid} and {zero_inf} at 0.0%; highest was {highest_inf['store']} at {float(highest_inf['value']):.1f}%."
         )
 
@@ -216,6 +209,7 @@ def _build_batch_table_card(
     entries: list[dict[str, str]],
     batch_header_text: str,
     batch_number: int,
+    settings: Settings,
 ) -> dict[str, object]:
     grid_items = [
         {"title": "Store", "textAlignment": "START"},
@@ -236,15 +230,15 @@ def _build_batch_table_card(
                     "textAlignment": "START",
                 },
                 {
-                    "title": format_metric_with_emoji(uph_val, UPH_THRESHOLD, is_uph=True),
+                    "title": format_metric_with_emoji(uph_val, settings.uph_threshold, is_uph=True),
                     "textAlignment": "CENTER",
                 },
                 {
-                    "title": format_metric_with_emoji(lates_val, LATES_THRESHOLD),
+                    "title": format_metric_with_emoji(lates_val, settings.lates_threshold),
                     "textAlignment": "CENTER",
                 },
                 {
-                    "title": format_metric_with_emoji(inf_val, INF_THRESHOLD),
+                    "title": format_metric_with_emoji(inf_val, settings.inf_threshold),
                     "textAlignment": "CENTER",
                 },
             ]
@@ -278,8 +272,13 @@ def _build_batch_table_card(
     }
 
 
-def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState) -> dict[str, object]:
-    batch_header_text = datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M")
+def build_batch_chat_payload(
+    entries: list[dict[str, str]],
+    state: ScraperState,
+    settings: Settings | None = None,
+) -> dict[str, object]:
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    batch_header_text = datetime.now(settings.local_timezone).strftime("%A %d %B, %H:%M")
     card_subtitle = f"{batch_header_text} • Batch {state.chat_batch_count} • {len(entries)} stores"
 
     sorted_entries = sorted(entries, key=lambda entry: sanitize_store_name(entry.get("store", "")))
@@ -290,20 +289,20 @@ def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState)
         {
             row["store"]
             for row in uph_rows
-            if float(row["value"]) < UPH_THRESHOLD
+            if float(row["value"]) < settings.uph_threshold
         }
         | {
             row["store"]
             for row in lates_rows
-            if float(row["value"]) > LATES_THRESHOLD
+            if float(row["value"]) > settings.lates_threshold
         }
         | {
             row["store"]
             for row in inf_rows
-            if float(row["value"]) > INF_THRESHOLD
+            if float(row["value"]) > settings.inf_threshold
         }
     )
-    summary_lines = _build_batch_summary_lines(sorted_entries)
+    summary_lines = _build_batch_summary_lines(sorted_entries, settings)
     outlier_lines = [
         _format_ranked_metric_line("Lowest UPH", uph_rows, descending=False),
         _format_ranked_metric_line("Highest Lates", lates_rows, descending=True, suffix="%", zero_is_all_clear=True),
@@ -387,7 +386,7 @@ def build_batch_chat_payload(entries: list[dict[str, str]], state: ScraperState)
                     "sections": sections,
                 },
             },
-            _build_batch_table_card(sorted_entries, batch_header_text, state.chat_batch_count),
+            _build_batch_table_card(sorted_entries, batch_header_text, state.chat_batch_count, settings),
         ]
     }
 
@@ -425,8 +424,13 @@ def _build_timing_text(store_timing: dict[str, object] | None) -> str:
     return f"{sanitize_store_name(str(store_timing['store']))} ({store_timing['seconds']:.2f}s)"
 
 
-def build_job_summary_payload(state: ScraperState, duration: float | None = None) -> dict[str, object]:
-    summary = build_run_summary(state)
+def build_job_summary_payload(
+    state: ScraperState,
+    settings: Settings | None = None,
+    duration: float | None = None,
+) -> dict[str, object]:
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    summary = build_run_summary(state, settings)
     duration_seconds = duration if duration is not None else float(summary["elapsed_seconds"])
     duration_seconds = max(duration_seconds, 0.0)
 
@@ -639,7 +643,7 @@ def build_job_summary_payload(state: ScraperState, duration: float | None = None
                 "card": {
                     "header": {
                         "title": f"{status_icon} {status_title} (1MMS)",
-                        "subtitle": datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M"),
+                        "subtitle": datetime.now(settings.local_timezone).strftime("%A %d %B, %H:%M"),
                         "imageUrl": CARD_IMAGE_URL,
                         "imageType": "CIRCLE",
                     },
@@ -650,62 +654,94 @@ def build_job_summary_payload(state: ScraperState, duration: float | None = None
     }
 
 
-async def post_to_chat_webhook(entries: list[dict[str, str]], state: ScraperState):
-    if not CHAT_WEBHOOK_URL or not entries:
+async def post_to_chat_webhook(
+    entries: list[dict[str, str]],
+    state: ScraperState,
+    settings: Settings | None = None,
+):
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    if not settings.chat_webhook_url or not entries:
         return
     try:
         state.chat_batch_count += 1
-        payload = build_batch_chat_payload(entries, state)
+        payload = build_batch_chat_payload(entries, state, settings)
 
         timeout = aiohttp.ClientTimeout(total=30)
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            async with session.post(CHAT_WEBHOOK_URL, json=payload) as resp:
+            async with session.post(settings.chat_webhook_url, json=payload) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     app_logger.error(f"Chat webhook post failed. Status: {resp.status}. Response: {error_text}")
+                    await state.record_issue(
+                        f"Chat batch post failed ({resp.status})",
+                        0.0,
+                        category="general",
+                    )
     except Exception as e:
-        app_logger.error(f"Error posting to chat webhook: {e}", exc_info=DEBUG_MODE)
+        app_logger.error(f"Error posting to chat webhook: {e}", exc_info=settings.debug_mode)
+        await state.record_issue("Chat batch post exception", 0.0, category="general")
 
 
-async def post_job_summary(state: ScraperState, duration: float | None = None):
-    if not CHAT_WEBHOOK_URL or state.job_summary_posted:
+async def post_job_summary(
+    state: ScraperState,
+    settings: Settings | None = None,
+    duration: float | None = None,
+):
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    if not settings.chat_webhook_url or state.job_summary_posted:
         return
     try:
-        payload = build_job_summary_payload(state, duration)
+        payload = build_job_summary_payload(state, settings, duration)
 
         timeout = aiohttp.ClientTimeout(total=30)
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         connector = aiohttp.TCPConnector(ssl=ssl_context)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            async with session.post(CHAT_WEBHOOK_URL, json=payload) as resp:
+            async with session.post(settings.chat_webhook_url, json=payload) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     app_logger.error(f"Job summary post failed: {resp.status}. Response: {error_text}")
+                    await state.record_issue(
+                        f"Job summary post failed ({resp.status})",
+                        0.0,
+                        category="general",
+                    )
                     return
 
         state.job_summary_posted = True
     except Exception as e:
-        app_logger.error(f"Error posting job summary: {e}", exc_info=DEBUG_MODE)
+        app_logger.error(f"Error posting job summary: {e}", exc_info=settings.debug_mode)
+        await state.record_issue("Job summary post exception", 0.0, category="general")
 
 
-async def add_to_pending_chat(entry: dict[str, str], state: ScraperState):
-    if not CHAT_WEBHOOK_URL:
-        return
-    async with state.pending_chat_lock:
-        state.pending_chat_entries.append(entry)
-        if len(state.pending_chat_entries) >= CHAT_BATCH_SIZE:
-            entries_to_send = state.pending_chat_entries[:CHAT_BATCH_SIZE]
-            del state.pending_chat_entries[:CHAT_BATCH_SIZE]
-            await post_to_chat_webhook(entries_to_send, state)
+async def chat_dispatcher_worker(
+    chat_queue: asyncio.Queue,
+    state: ScraperState,
+    settings: Settings | None = None,
+):
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    if not settings.chat_webhook_url:
+        while True:
+            item = await chat_queue.get()
+            chat_queue.task_done()
+            if item is None:
+                return
 
+    batch: list[dict[str, str]] = []
+    while True:
+        item = await chat_queue.get()
+        try:
+            if item is None:
+                if batch:
+                    await post_to_chat_webhook(batch, state, settings)
+                    batch = []
+                return
 
-async def flush_pending_chat_entries(state: ScraperState):
-    if not CHAT_WEBHOOK_URL:
-        return
-    async with state.pending_chat_lock:
-        if state.pending_chat_entries:
-            entries = state.pending_chat_entries[:]
-            state.pending_chat_entries.clear()
-            await post_to_chat_webhook(entries, state)
+            batch.append(item)
+            if len(batch) >= settings.chat_batch_size:
+                await post_to_chat_webhook(batch, state, settings)
+                batch = []
+        finally:
+            chat_queue.task_done()

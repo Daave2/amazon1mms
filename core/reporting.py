@@ -1,10 +1,15 @@
-import json
-import os
+from __future__ import annotations
+
 from collections import Counter
 from datetime import datetime
 from typing import Iterable, Mapping
 
-from core.config import INITIAL_CONCURRENCY, NUM_FORM_SUBMITTERS, OUTPUT_DIR
+from core.config import Settings, load_settings
+from core.utils import atomic_write_json, ensure_directory
+
+OUTPUT_DIR = "output"
+RUN_SUMMARY_FILE = f"{OUTPUT_DIR}/run_summary.json"
+FAILURE_EVENTS_FILE = f"{OUTPUT_DIR}/failure_events.json"
 
 FAILURE_CATEGORY_LABELS = {
     "api_fast_path": "API Fast Path",
@@ -24,9 +29,6 @@ DISCOVERY_REFRESH_REASON_LABELS = {
     "refresh_failed_used_cached_snapshot": "the scheduled refresh failed and the cached snapshot was reused",
 }
 
-RUN_SUMMARY_FILE = os.path.join(OUTPUT_DIR, "run_summary.json")
-FAILURE_EVENTS_FILE = os.path.join(OUTPUT_DIR, "failure_events.json")
-
 
 def _pluralize(word: str, count: int) -> str:
     return word if count == 1 else f"{word}s"
@@ -36,6 +38,12 @@ def extract_failure_source(message: str) -> str:
     if " (" in message and message.endswith(")"):
         return message[: message.rfind(" (")].strip()
     return message.strip()
+
+
+def _extract_failure_reason(message: str) -> str:
+    if "(" in message and ")" in message:
+        return message[message.rfind("(") + 1 : message.rfind(")")]
+    return message
 
 
 def summarize_failure_events(
@@ -59,12 +67,6 @@ def summarize_failure_events(
         "recent_failures": recent_failures[-recent_limit:],
         "overflow_count": max(len(recent_failures) - recent_limit, 0),
     }
-
-
-def _extract_failure_reason(message: str) -> str:
-    if "(" in message and ")" in message:
-        return message[message.rfind("(") + 1 : message.rfind(")")]
-    return message
 
 
 def build_failure_digest(
@@ -144,10 +146,7 @@ def build_dropdown_change_lines(summary: Mapping[str, object], detail_limit: int
 
     if refresh_mode == "cached":
         lines = [
-            (
-                "Live dropdown refresh was skipped for this run; "
-                f"using the cached snapshot because {reason_label}."
-            ),
+            f"Live dropdown refresh was skipped for this run; using the cached snapshot because {reason_label}.",
             (
                 f"Cached snapshot queued {discovery.get('live_dropdown_stores', 0)} stores, "
                 f"with {discovery.get('matched_configured', 0)} configured matches and "
@@ -168,12 +167,10 @@ def build_dropdown_change_lines(summary: Mapping[str, object], detail_limit: int
         missing_count = int(changes.get("missing_count", 0))
         if new_count or missing_count:
             lines.append(f"Dropdown changed since last run: {new_count} new and {missing_count} missing.")
-            new_stores = changes.get("new_stores", [])
-            missing_stores = changes.get("missing_stores", [])
-            if new_stores:
-                lines.append("New stores: " + ", ".join(_limit_named_list(new_stores, detail_limit)))
-            if missing_stores:
-                lines.append("Missing stores: " + ", ".join(_limit_named_list(missing_stores, detail_limit)))
+            if changes.get("new_stores"):
+                lines.append("New stores: " + ", ".join(_limit_named_list(changes["new_stores"], detail_limit)))
+            if changes.get("missing_stores"):
+                lines.append("Missing stores: " + ", ".join(_limit_named_list(changes["missing_stores"], detail_limit)))
         else:
             lines.append("Dropdown was unchanged since the previous run.")
 
@@ -203,21 +200,11 @@ def build_failure_digest_lines(summary: Mapping[str, object], digest_limit: int 
     return lines
 
 
-def build_github_step_summary_markdown(
-    summary: Mapping[str, object],
-    gate_reason: str = "",
-    gate_hour: str = "",
-) -> str:
+def build_github_step_summary_markdown(summary: Mapping[str, object], gate_reason: str = "", gate_hour: str = "") -> str:
     lines = ["## Scraper Run Summary", ""]
 
     if gate_reason:
-        lines.extend(
-            [
-                "### Gate",
-                "",
-                f"- Gate reason: `{gate_reason}`",
-            ]
-        )
+        lines.extend(["### Gate", "", f"- Gate reason: `{gate_reason}`"])
         if gate_hour and gate_hour != "manual":
             lines.append(f"- Current London hour: `{gate_hour}`")
         lines.append("")
@@ -279,11 +266,7 @@ def build_github_step_summary_markdown(
 
 def _summarize_timing_entries(entries: list[tuple[str, float]]) -> dict[str, object]:
     if not entries:
-        return {
-            "count": 0,
-            "average_seconds": 0.0,
-            "p95_seconds": 0.0,
-        }
+        return {"count": 0, "average_seconds": 0.0, "p95_seconds": 0.0}
 
     durations = sorted(duration for _store_name, duration in entries)
     average_seconds = sum(durations) / len(durations)
@@ -295,57 +278,46 @@ def _summarize_timing_entries(entries: list[tuple[str, float]]) -> dict[str, obj
     }
 
 
-def build_run_summary(state) -> dict[str, object]:
+def _build_store_timing_summary(store_timing: tuple[str, float] | None) -> dict[str, object] | None:
+    if not store_timing:
+        return None
+
+    store_name, duration = store_timing
+    return {"store": store_name, "seconds": round(duration, 3)}
+
+
+def build_run_summary(state, settings: Settings | None = None) -> dict[str, object]:
+    settings = settings or getattr(state, "settings", None) or load_settings()
     finished_at = state.run_finished_at or datetime.now(state.run_started_at.tzinfo)
-    started_at = state.run_started_at
-    elapsed_seconds = max((finished_at - started_at).total_seconds(), 0.0)
-    failure_summary = summarize_failure_events(state.failure_events)
-    failure_digest = build_failure_digest(state.failure_events)
+    elapsed_seconds = max((finished_at - state.run_started_at).total_seconds(), 0.0)
+    failure_events = state.failure_event_payload()
+    failure_summary = summarize_failure_events(failure_events)
+    failure_digest = build_failure_digest(failure_events)
 
-    collection_times = state.metrics["collection_times"]
-    path_collection_times = state.metrics["path_collection_times"]
-    submission_times = state.metrics["submission_times"]
+    collection_times = state.metrics.collection_times
+    path_collection_times = state.metrics.path_collection_times
+    submission_times = state.metrics.submission_times
 
-    avg_collection_seconds = (
-        sum(duration for _store_name, duration in collection_times) / len(collection_times)
-        if collection_times
-        else 0.0
-    )
-    avg_submission_seconds = (
-        sum(duration for _store_name, duration in submission_times) / len(submission_times)
-        if submission_times
-        else 0.0
-    )
+    avg_collection_seconds = sum(duration for _store_name, duration in collection_times) / len(collection_times) if collection_times else 0.0
+    avg_submission_seconds = sum(duration for _store_name, duration in submission_times) / len(submission_times) if submission_times else 0.0
 
     sorted_collection_times = sorted(duration for _store_name, duration in collection_times)
-    p95_collection_seconds = (
-        sorted_collection_times[int(len(sorted_collection_times) * 0.95)]
-        if sorted_collection_times
-        else 0.0
-    )
-
-    fastest_store = (
-        min(collection_times, key=lambda item: item[1])
-        if collection_times
-        else None
-    )
-    slowest_store = (
-        max(collection_times, key=lambda item: item[1])
-        if collection_times
-        else None
-    )
+    p95_collection_seconds = sorted_collection_times[int(len(sorted_collection_times) * 0.95)] if sorted_collection_times else 0.0
+    fastest_store = min(collection_times, key=lambda item: item[1]) if collection_times else None
+    slowest_store = max(collection_times, key=lambda item: item[1]) if collection_times else None
 
     return {
+        "run_id": state.run_id,
         "status": state.job_status,
         "status_detail": state.job_status_detail,
         "fatal_error_message": state.fatal_error_message,
         "trigger": state.job_trigger,
-        "started_at": started_at.isoformat(),
+        "started_at": state.run_started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "elapsed_seconds": round(elapsed_seconds, 3),
         "configured_concurrency": {
-            "browser_workers": state.browser_worker_pool_size or INITIAL_CONCURRENCY,
-            "form_submitters": state.form_submitter_count or NUM_FORM_SUBMITTERS,
+            "browser_workers": state.browser_worker_pool_size or settings.initial_concurrency,
+            "form_submitters": state.form_submitter_count or settings.num_form_submitters,
         },
         "routing": {
             "fast_path_eligible_at_start": state.fast_path_eligible_at_start,
@@ -353,22 +325,20 @@ def build_run_summary(state) -> dict[str, object]:
             "requeued_from_fast_path": state.requeued_from_fast_path,
         },
         "stores": {
-            "total": state.progress["total"],
-            "successful_submissions": state.progress["current"],
+            "total": state.progress.total,
+            "successful_submissions": state.progress.current,
             "failed": len(state.run_failures),
         },
         "issues": {
-            "total_events": len(state.failure_events),
+            "total_events": len(failure_events),
             "terminal_failures": len(state.run_failures),
-            "non_terminal_events": max(len(state.failure_events) - len(state.run_failures), 0),
+            "non_terminal_events": max(len(failure_events) - len(state.run_failures), 0),
         },
         "retries": {
-            "total": state.metrics["retries"],
-            "stores": len(state.metrics["retry_stores"]),
+            "total": state.metrics.retries,
+            "stores": len(state.metrics.retry_stores),
         },
-        "auth": {
-            "state": state.auth_state_status,
-        },
+        "auth": {"state": state.auth_state_status},
         "discovery_cache": {
             "template_available_at_start": state.cache_template_available_at_start,
             "merchant_id_count_at_start": state.cache_merchant_ids_at_start,
@@ -403,41 +373,37 @@ def build_run_summary(state) -> dict[str, object]:
         },
         "submission_metrics": {
             "average_seconds": round(avg_submission_seconds, 3),
+            "queued": state.submissions.queued,
+            "sent": state.submissions.sent,
+            "replayed": state.submissions.replayed,
+            "retryable_failures": state.submissions.retryable_failures,
+            "terminal_failures": state.submissions.terminal_failures,
         },
         "business_totals": {
-            "orders": state.metrics["total_orders"],
-            "units": state.metrics["total_units"],
+            "orders": state.metrics.total_orders,
+            "units": state.metrics.total_units,
         },
         "failure_summary": failure_summary,
         "failure_digest": failure_digest,
     }
 
 
-def write_runtime_reports(state) -> dict[str, object]:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def write_runtime_reports(state, settings: Settings | None = None) -> dict[str, object]:
+    explicit_settings = settings is not None
+    settings = settings or getattr(state, "settings", None) or load_settings()
+    output_dir = settings.output_dir if explicit_settings else OUTPUT_DIR
+    run_summary_file = settings.run_summary_file if explicit_settings else RUN_SUMMARY_FILE
+    failure_events_file = settings.failure_events_file if explicit_settings else FAILURE_EVENTS_FILE
+    ensure_directory(output_dir)
 
-    run_summary = build_run_summary(state)
+    run_summary = build_run_summary(state, settings)
     failure_events_payload = {
         "generated_at": (state.run_finished_at or datetime.now(state.run_started_at.tzinfo)).isoformat(),
         "count": len(state.failure_events),
-        "events": list(state.failure_events),
+        "events": state.failure_event_payload(),
     }
 
-    with open(RUN_SUMMARY_FILE, "w", encoding="utf-8") as file_handle:
-        json.dump(run_summary, file_handle, indent=2)
-
-    with open(FAILURE_EVENTS_FILE, "w", encoding="utf-8") as file_handle:
-        json.dump(failure_events_payload, file_handle, indent=2)
+    atomic_write_json(run_summary_file, run_summary, indent=2)
+    atomic_write_json(failure_events_file, failure_events_payload, indent=2)
 
     return run_summary
-
-
-def _build_store_timing_summary(store_timing: tuple[str, float] | None) -> dict[str, object] | None:
-    if not store_timing:
-        return None
-
-    store_name, duration = store_timing
-    return {
-        "store": store_name,
-        "seconds": round(duration, 3),
-    }

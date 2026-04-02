@@ -12,7 +12,6 @@ from core.store_loader import parse_store_row
 
 DEFAULTS = {
     "TARGET_URL": "https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx",
-    "FORM_POST_URL": "https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse",
     "INITIAL_CONCURRENCY": 30,
     "NUM_FORM_SUBMITTERS": 2,
     "AUTO_ENABLED": True,
@@ -26,6 +25,7 @@ REQUIRED_ENV_VARS = (
     "LOGIN_EMAIL",
     "LOGIN_PASSWORD",
     "OTP_SECRET_KEY",
+    "FORM_POST_URL",
 )
 
 HTTPS_URL_VARS = (
@@ -58,7 +58,7 @@ def run_preflight(
     validated_urls = {
         "login_url": _required_value("LOGIN_URL"),
         "target_url": os.getenv("TARGET_URL", DEFAULTS["TARGET_URL"]),
-        "form_post_url": os.getenv("FORM_POST_URL", DEFAULTS["FORM_POST_URL"]),
+        "form_post_url": _required_value("FORM_POST_URL"),
         "chat_webhook_url": os.getenv("CHAT_WEBHOOK_URL", ""),
     }
 
@@ -66,8 +66,6 @@ def run_preflight(
         value = os.getenv(env_name, "").strip()
         if not value and env_name == "TARGET_URL":
             value = str(DEFAULTS["TARGET_URL"])
-        if not value and env_name == "FORM_POST_URL":
-            value = str(DEFAULTS["FORM_POST_URL"])
         if value:
             _validate_https_url(env_name, value, errors)
 
