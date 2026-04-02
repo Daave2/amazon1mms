@@ -271,7 +271,8 @@ def build_store_submission(store_name: str, api_data: list[dict] | dict) -> tupl
 
 def _fast_path_warmup_window(state: ScraperState) -> int:
     worker_pool_size = state.browser_worker_pool_size or FAST_PATH_MAX_CONCURRENCY
-    return max(FAST_PATH_WARMUP_REQUESTS, min(worker_pool_size, FAST_PATH_MAX_CONCURRENCY))
+    scaled_window = min((worker_pool_size + 1) // 2, 6)
+    return max(FAST_PATH_WARMUP_REQUESTS, scaled_window)
 
 
 async def _wait_for_fast_path_backpressure(state: ScraperState, store_name: str):

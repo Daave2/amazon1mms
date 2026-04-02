@@ -308,7 +308,7 @@ async def test_fetch_metrics_fast_path_retries_transient_503_then_succeeds(monke
 
 
 @pytest.mark.asyncio
-async def test_fetch_metrics_fast_path_expands_warmup_to_worker_pool_size(monkeypatch):
+async def test_fetch_metrics_fast_path_scales_warmup_to_half_the_worker_pool(monkeypatch):
     sleep_calls: list[float] = []
 
     async def no_sleep(seconds):
@@ -320,7 +320,7 @@ async def test_fetch_metrics_fast_path_expands_warmup_to_worker_pool_size(monkey
     request_client = FakeRequestClient([200])
     state = ScraperState()
     state.browser_worker_pool_size = 12
-    state.fast_path_started_count = 11
+    state.fast_path_started_count = 5
 
     await metrics_service.fetch_metrics_fast_path(
         request_client,
@@ -330,7 +330,33 @@ async def test_fetch_metrics_fast_path_expands_warmup_to_worker_pool_size(monkey
         45_000,
     )
 
-    assert sleep_calls == [pytest.approx(1.65, abs=0.01)]
+    assert sleep_calls == [pytest.approx(0.75, abs=0.01)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_metrics_fast_path_skips_warmup_after_scaled_window(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def no_sleep(seconds):
+        sleep_calls.append(seconds)
+        return None
+
+    monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
+
+    request_client = FakeRequestClient([200])
+    state = ScraperState()
+    state.browser_worker_pool_size = 12
+    state.fast_path_started_count = 6
+
+    await metrics_service.fetch_metrics_fast_path(
+        request_client,
+        "https://example.com/metrics?merchantIds%5B%5D=MID123",
+        "Belle Vale Morrisons",
+        state,
+        45_000,
+    )
+
+    assert sleep_calls == []
 
 
 @pytest.mark.asyncio
