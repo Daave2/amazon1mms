@@ -223,6 +223,29 @@ You do not need `config.json` for `scraper.py`.
    python3 scraper.py
    ```
 
+## Changing Settings
+
+All scraper settings are environment variables loaded from `.env`.
+The normal workflow is:
+
+1. Edit [`.env.example`](./.env.example) only as a reference.
+2. Put your actual values in `.env`.
+3. Run `python3 scripts/preflight.py`.
+4. Run `python3 scraper.py`.
+
+Common changes:
+
+- Reduce UI flake sensitivity: increase `WORKER_RETRY_COUNT`.
+- Force a fresh live-dropdown snapshot: set `FORCE_DROPDOWN_DISCOVERY=true`.
+- Refresh the cached live-dropdown list more or less often: change `DROPDOWN_REFRESH_MAX_AGE_DAYS`.
+- Increase throughput: raise `INITIAL_CONCURRENCY` and, if auto-scaling is enabled, review `AUTO_MAX_CONCURRENCY`.
+- Make fast-path API collection gentler: lower `FAST_PATH_MAX_CONCURRENCY` or raise `FAST_PATH_WARMUP_DELAY_MS`.
+- Change runtime timeouts: adjust `PAGE_TIMEOUT`, `WAIT_TIMEOUT`, and `ACTION_TIMEOUT`.
+- Disable chat cards: leave `CHAT_WEBHOOK_URL` empty.
+- Debug the browser flow interactively: set `DEBUG=true`.
+
+If you are unsure whether a change is valid, `python3 scripts/preflight.py` is the quickest check before a full run.
+
 ## Testing
 
 Install the dev dependencies before running the test suite:
@@ -271,6 +294,9 @@ Browser investigation scripts in `scripts/debug/` are manual probes, are not par
 | `FORM_POST_URL` | Yes | Google Forms endpoint that receives normalized store rows | none |
 | `INITIAL_CONCURRENCY` | No | Initial number of browser workers | `30` |
 | `NUM_FORM_SUBMITTERS` | No | Number of submission workers for Google Forms | `2` |
+| `DROPDOWN_REFRESH_MAX_AGE_DAYS` | No | Maximum age of the cached live-dropdown snapshot before a refresh is attempted | `7` |
+| `FORCE_DROPDOWN_DISCOVERY` | No | Ignore the cache and force a fresh live-dropdown discovery run | `false` |
+| `WORKER_RETRY_COUNT` | No | Number of UI fallback retries for a store before marking it failed | `3` |
 | `FAST_PATH_MAX_CONCURRENCY` | No | Separate concurrency cap for direct metrics API calls | `12` |
 | `FAST_PATH_WARMUP_REQUESTS` | No | Number of initial fast-path calls to stagger during startup | `4` |
 | `FAST_PATH_WARMUP_DELAY_MS` | No | Extra delay added between early fast-path calls | `150` |
@@ -279,8 +305,21 @@ Browser investigation scripts in `scripts/debug/` are manual probes, are not par
 | `AUTO_ENABLED` | No | Enable automatic concurrency adjustment | `true` |
 | `AUTO_MIN_CONCURRENCY` | No | Minimum allowed active browser workers | `1` |
 | `AUTO_MAX_CONCURRENCY` | No | Maximum allowed active browser workers | `40` |
+| `CPU_UPPER_THRESHOLD` | No | CPU percentage that triggers concurrency reduction | `90` |
+| `CPU_LOWER_THRESHOLD` | No | CPU percentage below which concurrency can increase | `65` |
+| `MEM_UPPER_THRESHOLD` | No | Memory percentage that triggers concurrency reduction | `90` |
+| `CHECK_INTERVAL` | No | Seconds between auto-concurrency checks | `5` |
+| `COOLDOWN_SECONDS` | No | Minimum delay between concurrency changes | `15` |
+| `PAGE_TIMEOUT` | No | Playwright page navigation timeout in milliseconds | `30000` |
+| `WAIT_TIMEOUT` | No | Playwright wait timeout in milliseconds | `15000` |
+| `ACTION_TIMEOUT` | No | Playwright action timeout in milliseconds | `15000` |
+| `MAX_LOGIN_ATTEMPTS` | No | Number of times to retry full session priming before aborting | `3` |
+| `LOCAL_TIMEZONE` | No | Time zone used for logs, reports, and date formatting | `Europe/London` |
+| `OUTPUT_DIR` | No | Directory for runtime artifacts, logs, screenshots, and reports | `output` |
+| `APP_LOG_FILE` | No | Path to the rotating application log file | `app.log` |
+| `STORAGE_STATE` | No | Path to the saved Playwright auth state file | `state.json` |
 
-See [`.env.example`](./.env.example) for a minimal local template.
+See [`.env.example`](./.env.example) for a fuller local template with the most common overrides.
 
 ## GitHub Actions Operation
 
