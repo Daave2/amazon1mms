@@ -225,11 +225,14 @@ You do not need `config.json` for `scraper.py`.
 
 ## Changing Settings
 
-All scraper settings are environment variables loaded from `.env`.
+All scraper settings are environment variables.
+For local runs, they are usually loaded from a local `.env` file that you create yourself.
+That `.env` file is not committed to the repository.
+For GitHub Actions, the workflow injects the same settings from repository secrets and workflow `env`.
 The normal workflow is:
 
-1. Edit [`.env.example`](./.env.example) only as a reference.
-2. Put your actual values in `.env`.
+1. Use [`.env.example`](./.env.example) as the committed template.
+2. Create a local `.env` file and put your actual values there.
 3. Run `python3 scripts/preflight.py`.
 4. Run `python3 scraper.py`.
 
