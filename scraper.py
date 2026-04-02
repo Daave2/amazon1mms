@@ -44,6 +44,7 @@ def load_default_data(state: ScraperState) -> list:
     state.cache.load()
     state.cache_template_available_at_start = bool(state.cache.api_url_template)
     state.cache_merchant_ids_at_start = len(state.cache.merchant_id_cache)
+    state.previous_live_dropdown_store_names = list(state.cache.live_dropdown_store_names)
 
     try:
         urls_data = load_stores_from_csv(
@@ -254,6 +255,15 @@ async def load_live_dropdown_stores(
 
     filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
 
+    current_live_store_names = sorted({store["store_name"] for store in available_stores})
+    previous_live_store_names = sorted(set(state.previous_live_dropdown_store_names))
+    current_live_store_name_set = set(current_live_store_names)
+    previous_live_store_name_set = set(previous_live_store_names)
+
+    state.current_live_dropdown_store_names = current_live_store_names
+    state.live_dropdown_new_stores = sorted(current_live_store_name_set - previous_live_store_name_set)
+    state.live_dropdown_missing_stores = sorted(previous_live_store_name_set - current_live_store_name_set)
+
     cache_updated = False
     for store in filtered_stores:
         merchant_id = store.get("merchant_id", "").strip()
@@ -261,19 +271,41 @@ async def load_live_dropdown_stores(
             state.cache.merchant_id_cache[store["store_name"]] = merchant_id
             cache_updated = True
 
+    if current_live_store_names != state.cache.live_dropdown_store_names:
+        state.cache.live_dropdown_store_names = current_live_store_names
+        cache_updated = True
+
     if cache_updated:
         await state.cache.save()
 
     matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
     live_only_count = len(filtered_stores) - matched_configured_count
+    live_only_store_names = [
+        store["store_name"]
+        for store in filtered_stores
+        if not store.get("matched_from_configured")
+    ]
     state.live_dropdown_store_count = len(filtered_stores)
     state.live_dropdown_matched_configured_count = matched_configured_count
     state.live_dropdown_live_only_count = live_only_count
+    state.live_dropdown_live_only_store_names = live_only_store_names
     state.live_dropdown_skipped_configured_count = len(skipped_stores)
     app_logger.info(
         f"Live dropdown queue contains {len(filtered_stores)} store(s): "
         f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
     )
+    if state.live_dropdown_new_stores:
+        app_logger.info(
+            "Live dropdown added since last run: "
+            + ", ".join(state.live_dropdown_new_stores[:10])
+            + ("..." if len(state.live_dropdown_new_stores) > 10 else "")
+        )
+    if state.live_dropdown_missing_stores:
+        app_logger.warning(
+            "Live dropdown missing since last run: "
+            + ", ".join(state.live_dropdown_missing_stores[:10])
+            + ("..." if len(state.live_dropdown_missing_stores) > 10 else "")
+        )
     if skipped_stores:
         skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
         suffix = "..." if len(skipped_stores) > 10 else ""

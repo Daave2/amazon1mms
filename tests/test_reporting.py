@@ -23,6 +23,9 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     state.metrics["retry_stores"].add("Belle Vale Morrisons")
     state.metrics["total_orders"] = 50
     state.metrics["total_units"] = 200
+    state.live_dropdown_store_count = 2
+    state.live_dropdown_matched_configured_count = 2
+    state.current_live_dropdown_store_names = ["Belle Vale", "Carterton"]
 
     _patch_reporting_paths(monkeypatch, tmp_path)
     summary = reporting.write_runtime_reports(state)
@@ -30,6 +33,7 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     assert summary["status"] == "completed"
     assert summary["stores"]["successful_submissions"] == 2
     assert summary["discovery_cache"]["template_available_at_start"] is True
+    assert summary["discovery"]["live_dropdown_stores"] == 2
     assert summary["collection_metrics"]["fastest_store"] == {
         "store": "Belle Vale Morrisons",
         "seconds": 1.4,
@@ -73,6 +77,26 @@ def test_build_run_summary_for_partial_success_with_mixed_failures():
         "cleanup": 1,
     }
     assert summary["failure_summary"]["reason_counts"]["HTTP Submit Fail 500"] == 1
+    assert summary["failure_digest"] == [
+        {
+            "category": "submission",
+            "label": "Submission",
+            "events": 1,
+            "terminal": 1,
+            "affected_sources": 1,
+            "top_reason": "HTTP Submit Fail 500",
+            "top_reasons": ["HTTP Submit Fail 500"],
+        },
+        {
+            "category": "cleanup",
+            "label": "Cleanup",
+            "events": 1,
+            "terminal": 0,
+            "affected_sources": 1,
+            "top_reason": "Cleanup failure",
+            "top_reasons": ["Cleanup failure"],
+        },
+    ]
 
 
 def test_build_run_summary_for_login_abort():
@@ -94,6 +118,108 @@ def test_build_run_summary_for_fatal_exception():
 
     assert summary["status"] == "fatal"
     assert summary["fatal_error_message"] == "Browser launch failed"
+
+
+def test_build_dropdown_change_and_failure_digest_lines():
+    summary = {
+        "discovery": {
+            "live_dropdown_stores": 85,
+            "matched_configured": 84,
+            "live_only": 1,
+            "live_only_store_names": ["Morrisons Live Only"],
+            "changes": {
+                "new_count": 2,
+                "missing_count": 1,
+                "new_stores": ["Belle Vale", "Carterton"],
+                "missing_stores": ["Welling"],
+            },
+        },
+        "failure_digest": [
+            {
+                "label": "API Fast Path",
+                "events": 3,
+                "terminal": 1,
+                "affected_sources": 2,
+                "top_reason": "API returned 504",
+            },
+            {
+                "label": "Submission",
+                "events": 1,
+                "terminal": 1,
+                "affected_sources": 1,
+                "top_reason": "HTTP Submit Fail 500",
+            },
+        ],
+    }
+
+    dropdown_lines = reporting.build_dropdown_change_lines(summary)
+    failure_digest_lines = reporting.build_failure_digest_lines(summary)
+
+    assert dropdown_lines == [
+        "Live dropdown queued 85 stores, with 84 configured matches and 1 live-only store.",
+        "Dropdown changed since last run: 2 new and 1 missing.",
+        "New stores: Belle Vale, Carterton",
+        "Missing stores: Welling",
+        "Live-only stores: Morrisons Live Only",
+    ]
+    assert failure_digest_lines == [
+        "API Fast Path: 3 event(s), 1 terminal, 2 affected source(s); top reason: API returned 504",
+        "Submission: 1 event(s), 1 terminal, 1 affected source(s); top reason: HTTP Submit Fail 500",
+    ]
+
+
+def test_build_github_step_summary_markdown_includes_dropdown_and_failure_digest():
+    summary = {
+        "status": "completed_with_failures",
+        "status_detail": "2 terminal failure(s)",
+        "trigger": "workflow_dispatch",
+        "elapsed_seconds": 40.55,
+        "stores": {"successful_submissions": 83, "total": 85, "failed": 2},
+        "retries": {"total": 3, "stores": 2},
+        "auth": {"state": "refreshed"},
+        "discovery": {
+            "live_dropdown_stores": 85,
+            "matched_configured": 84,
+            "live_only": 1,
+            "live_only_store_names": ["Live Only Store"],
+            "changes": {
+                "new_count": 1,
+                "missing_count": 1,
+                "new_stores": ["Belle Vale"],
+                "missing_stores": ["Welling"],
+            },
+        },
+        "collection_metrics": {
+            "fastest_store": {"store": "Belle Vale Morrisons", "seconds": 8.4},
+            "slowest_store": {"store": "Morrisons Welling", "seconds": 11.2},
+        },
+        "failure_digest": [
+            {
+                "label": "Submission",
+                "events": 2,
+                "terminal": 2,
+                "affected_sources": 2,
+                "top_reason": "HTTP Submit Fail 500",
+            }
+        ],
+        "failure_summary": {
+            "recent_failures": ["Belle Vale Morrisons (HTTP Submit Fail 500)"],
+        },
+    }
+
+    markdown = reporting.build_github_step_summary_markdown(
+        summary,
+        gate_reason="manual_dispatch",
+        gate_hour="manual",
+    )
+
+    assert "## Scraper Run Summary" in markdown
+    assert "- Gate reason: `manual_dispatch`" in markdown
+    assert "### Dropdown" in markdown
+    assert "- Dropdown changed since last run: 1 new and 1 missing." in markdown
+    assert "- Live-only stores: Live Only Store" in markdown
+    assert "### Failure Digest" in markdown
+    assert "- Submission: 2 event(s), 2 terminal, 2 affected source(s); top reason: HTTP Submit Fail 500" in markdown
 
 
 def _build_state(status: str, detail: str) -> ScraperState:

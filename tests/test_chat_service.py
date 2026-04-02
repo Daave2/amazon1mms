@@ -93,8 +93,13 @@ def test_build_job_summary_payload_includes_run_context_and_issues():
     state.live_dropdown_store_count = 85
     state.live_dropdown_matched_configured_count = 84
     state.live_dropdown_live_only_count = 1
+    state.live_dropdown_live_only_store_names = ["Live Only Store"]
     state.live_dropdown_skipped_configured_count = 18
     state.live_dropdown_discovery_attempt = "settled-load"
+    state.previous_live_dropdown_store_names = ["Welling"]
+    state.current_live_dropdown_store_names = ["Belle Vale", "Live Only Store"]
+    state.live_dropdown_new_stores = ["Belle Vale"]
+    state.live_dropdown_missing_stores = ["Welling"]
     state.progress["total"] = 85
     state.progress["current"] = 83
     state.run_failures = [
@@ -142,7 +147,9 @@ def test_build_job_summary_payload_includes_run_context_and_issues():
         "Run Context",
         "Volume & Performance",
         "Collection Extremes",
-        "Issues",
+        "Dropdown Changes",
+        "Failure Digest",
+        "Recent Events",
     ]
     assert (
         card["sections"][1]["widgets"][1]["decoratedText"]["text"]
@@ -151,8 +158,18 @@ def test_build_job_summary_payload_includes_run_context_and_issues():
     assert "85 queued • 84 configured • 1 live-only • 18 skipped • via settled-load" == (
         card["sections"][1]["widgets"][2]["decoratedText"]["text"]
     )
-    assert "Submission: 1" in card["sections"][4]["widgets"][1]["textParagraph"]["text"]
-    assert "Cleanup: 1" in card["sections"][4]["widgets"][1]["textParagraph"]["text"]
+    assert "Dropdown changed since last run: 1 new and 1 missing." in (
+        card["sections"][4]["widgets"][0]["textParagraph"]["text"]
+    )
+    assert "Submission: 1 event(s), 1 terminal, 1 affected source(s); top reason: HTTP Submit Fail 500" in (
+        card["sections"][5]["widgets"][1]["textParagraph"]["text"]
+    )
+    assert "Cleanup: 1 event(s), 0 terminal, 1 affected source(s); top reason: Cleanup failure" in (
+        card["sections"][5]["widgets"][1]["textParagraph"]["text"]
+    )
+    assert "Morrisons Chippenham (HTTP Submit Fail 500)" in (
+        card["sections"][6]["widgets"][0]["textParagraph"]["text"]
+    )
 
 
 def test_build_job_summary_payload_shows_fatal_error_section():

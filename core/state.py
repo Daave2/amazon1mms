@@ -12,6 +12,7 @@ class CacheManager:
     def __init__(self):
         self.api_url_template = None
         self.merchant_id_cache = {}
+        self.live_dropdown_store_names: list[str] = []
         self.lock = asyncio.Lock()
 
     def load(self):
@@ -21,6 +22,7 @@ class CacheManager:
                     data = json.load(f)
                     self.api_url_template = data.get("template")
                     self.merchant_id_cache.update(data.get("merchant_ids", {}))
+                    self.live_dropdown_store_names = sorted(data.get("live_dropdown_store_names", []))
                     app_logger.info(f"Loaded {len(self.merchant_id_cache)} discovered IDs from cache.")
             except Exception as e:
                 app_logger.warning(f"Failed to load discovery cache: {e}")
@@ -30,6 +32,7 @@ class CacheManager:
             data = {
                 "template": self.api_url_template,
                 "merchant_ids": self.merchant_id_cache,
+                "live_dropdown_store_names": self.live_dropdown_store_names,
                 "last_updated": datetime.now(LOCAL_TIMEZONE).isoformat(),
             }
             try:
@@ -82,8 +85,13 @@ class ScraperState:
         self.live_dropdown_store_count = 0
         self.live_dropdown_matched_configured_count = 0
         self.live_dropdown_live_only_count = 0
+        self.live_dropdown_live_only_store_names: list[str] = []
         self.live_dropdown_skipped_configured_count = 0
         self.live_dropdown_discovery_attempt = ""
+        self.previous_live_dropdown_store_names: list[str] = []
+        self.current_live_dropdown_store_names: list[str] = []
+        self.live_dropdown_new_stores: list[str] = []
+        self.live_dropdown_missing_stores: list[str] = []
         self.job_summary_posted = False
 
         self.progress = {"current": 0, "total": 0, "lastUpdate": "N/A"}

@@ -1,5 +1,6 @@
 import csv
 
+import core.state as state_module
 from core.state import CacheManager
 
 
@@ -23,3 +24,25 @@ def test_update_csv_with_cache_only_backfills_blank_merchant_ids(tmp_path, monke
 
     assert rows[1][0] == "A1"
     assert rows[2][0] == "DISCOVERED"
+
+
+async def _save_cache(cache: CacheManager):
+    await cache.save()
+
+
+def test_cache_manager_persists_live_dropdown_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(state_module, "DISCOVERY_CACHE_FILE", str(tmp_path / "discovery_cache.json"))
+
+    cache = CacheManager()
+    cache.merchant_id_cache["Belle Vale Morrisons"] = "MID-1"
+    cache.live_dropdown_store_names = ["Belle Vale", "Welling"]
+
+    import asyncio
+
+    asyncio.run(_save_cache(cache))
+
+    loaded_cache = CacheManager()
+    loaded_cache.load()
+
+    assert loaded_cache.merchant_id_cache == {"Belle Vale Morrisons": "MID-1"}
+    assert loaded_cache.live_dropdown_store_names == ["Belle Vale", "Welling"]

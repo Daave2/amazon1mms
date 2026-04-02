@@ -145,8 +145,8 @@ jobs:
         path: ~/.cache/ms-playwright
         key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
 
-    - name: Install Playwright browsers & deps
-      run: python -m playwright install --with-deps chromium
+    - name: Install Playwright browser
+      run: python -m playwright install chromium
 
     - name: Run scraper
       run: python scraper.py
@@ -162,71 +162,31 @@ jobs:
         import os
         from pathlib import Path
 
-        lines = ["## Scraper Run Summary", ""]
+        from core.reporting import build_github_step_summary_markdown
+
         gate_reason = os.getenv("GATE_REASON", "")
         gate_hour = os.getenv("GATE_CURRENT_UK_HOUR", "")
-
-        if gate_reason:
-            lines.append("### Gate")
-            lines.append("")
-            lines.append(f"- Gate reason: `{gate_reason}`")
-            if gate_hour and gate_hour != "manual":
-                lines.append(f"- Current London hour: `{gate_hour}`")
-            lines.append("")
 
         summary_path = Path("output/run_summary.json")
         if summary_path.exists():
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            stores = summary.get("stores", {})
-            retries = summary.get("retries", {})
-            collection = summary.get("collection_metrics", {})
-
-            lines.extend(
+            markdown = build_github_step_summary_markdown(
+                summary,
+                gate_reason=gate_reason,
+                gate_hour=gate_hour,
+            )
+        else:
+            markdown = "\n".join(
                 [
-                    f"- Status: `{summary.get('status', 'unknown')}`",
-                    f"- Trigger: `{summary.get('trigger', 'unknown')}`",
-                    f"- Duration: `{summary.get('elapsed_seconds', 0)}s`",
-                    f"- Successful submissions: `{stores.get('successful_submissions', 0)}` / `{stores.get('total', 0)}`",
-                    f"- Terminal failures: `{stores.get('failed', 0)}`",
-                    f"- Retries: `{retries.get('total', 0)}` across `{retries.get('stores', 0)}` store(s)",
-                    f"- Auth state: `{summary.get('auth', {}).get('state', 'unknown')}`",
-                    f"- Discovery template at start: `{summary.get('discovery_cache', {}).get('template_available_at_start', False)}`",
+                    "## Scraper Run Summary",
+                    "",
+                    "Runtime summary was not generated. Check the preflight step or earlier job failure output.",
                     "",
                 ]
             )
 
-            fastest = collection.get("fastest_store")
-            slowest = collection.get("slowest_store")
-            if fastest or slowest:
-                lines.append("### Timing")
-                lines.append("")
-                if fastest:
-                    lines.append(f"- Fastest store: `{fastest['store']}` in `{fastest['seconds']}s`")
-                if slowest:
-                    lines.append(f"- Slowest store: `{slowest['store']}` in `{slowest['seconds']}s`")
-                lines.append("")
-
-            category_counts = summary.get("failure_summary", {}).get("category_counts", {})
-            if category_counts:
-                lines.append("### Failure Categories")
-                lines.append("")
-                lines.append("| Category | Count |")
-                lines.append("| --- | ---: |")
-                for category, count in sorted(category_counts.items()):
-                    lines.append(f"| `{category}` | {count} |")
-                lines.append("")
-
-            recent_failures = summary.get("failure_summary", {}).get("recent_failures", [])
-            if recent_failures:
-                lines.append("### Recent Failures")
-                lines.append("")
-                for failure in recent_failures:
-                    lines.append(f"- {failure}")
-        else:
-            lines.append("Runtime summary was not generated. Check the preflight step or earlier job failure output.")
-
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as file_handle:
-            file_handle.write("\n".join(lines) + "\n")
+            file_handle.write(markdown)
         PY
 
     - name: Upload artifacts on failure or success

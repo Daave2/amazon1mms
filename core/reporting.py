@@ -19,6 +19,16 @@ RUN_SUMMARY_FILE = os.path.join(OUTPUT_DIR, "run_summary.json")
 FAILURE_EVENTS_FILE = os.path.join(OUTPUT_DIR, "failure_events.json")
 
 
+def _pluralize(word: str, count: int) -> str:
+    return word if count == 1 else f"{word}s"
+
+
+def extract_failure_source(message: str) -> str:
+    if " (" in message and message.endswith(")"):
+        return message[: message.rfind(" (")].strip()
+    return message.strip()
+
+
 def summarize_failure_events(
     failure_events: Iterable[Mapping[str, object]],
     recent_limit: int = 5,
@@ -48,11 +58,203 @@ def _extract_failure_reason(message: str) -> str:
     return message
 
 
+def build_failure_digest(
+    failure_events: Iterable[Mapping[str, object]],
+    category_limit: int = 5,
+    reason_limit: int = 3,
+) -> list[dict[str, object]]:
+    digest_by_category: dict[str, dict[str, object]] = {}
+
+    for event in failure_events:
+        category = str(event.get("category", "general"))
+        message = str(event.get("message", "Unknown issue"))
+        terminal = bool(event.get("terminal", False))
+        reason = _extract_failure_reason(message)
+        source = extract_failure_source(message)
+
+        digest_entry = digest_by_category.setdefault(
+            category,
+            {
+                "events": 0,
+                "terminal": 0,
+                "sources": set(),
+                "reason_counts": Counter(),
+            },
+        )
+        digest_entry["events"] += 1
+        if terminal:
+            digest_entry["terminal"] += 1
+        digest_entry["sources"].add(source)
+        digest_entry["reason_counts"][reason] += 1
+
+    digests: list[dict[str, object]] = []
+    for category, digest_entry in digest_by_category.items():
+        reason_counts = digest_entry["reason_counts"]
+        top_reasons = [reason for reason, _count in reason_counts.most_common(reason_limit)]
+        digests.append(
+            {
+                "category": category,
+                "label": FAILURE_CATEGORY_LABELS.get(category, category.title()),
+                "events": digest_entry["events"],
+                "terminal": digest_entry["terminal"],
+                "affected_sources": len(digest_entry["sources"]),
+                "top_reason": top_reasons[0] if top_reasons else "",
+                "top_reasons": top_reasons,
+            }
+        )
+
+    digests.sort(key=lambda item: (-int(item["events"]), -int(item["terminal"]), str(item["label"])))
+    return digests[:category_limit]
+
+
+def _limit_named_list(values: Iterable[str], limit: int = 5) -> list[str]:
+    items = list(values)
+    if len(items) <= limit:
+        return items
+    return [*items[:limit], f"...and {len(items) - limit} more"]
+
+
+def build_dropdown_change_lines(summary: Mapping[str, object], detail_limit: int = 5) -> list[str]:
+    discovery = summary.get("discovery", {})
+    changes = discovery.get("changes", {})
+    if (
+        int(discovery.get("live_dropdown_stores", 0)) == 0
+        and int(discovery.get("matched_configured", 0)) == 0
+        and int(discovery.get("live_only", 0)) == 0
+        and int(changes.get("previous_count", 0)) == 0
+        and int(changes.get("current_count", 0)) == 0
+        and int(changes.get("new_count", 0)) == 0
+        and int(changes.get("missing_count", 0)) == 0
+    ):
+        return []
+
+    lines = [
+        (
+            f"Live dropdown queued {discovery.get('live_dropdown_stores', 0)} stores, "
+            f"with {discovery.get('matched_configured', 0)} configured matches and "
+            f"{discovery.get('live_only', 0)} live-only {_pluralize('store', int(discovery.get('live_only', 0)))}."
+        )
+    ]
+
+    new_count = int(changes.get("new_count", 0))
+    missing_count = int(changes.get("missing_count", 0))
+    if new_count or missing_count:
+        lines.append(f"Dropdown changed since last run: {new_count} new and {missing_count} missing.")
+        new_stores = changes.get("new_stores", [])
+        missing_stores = changes.get("missing_stores", [])
+        if new_stores:
+            lines.append("New stores: " + ", ".join(_limit_named_list(new_stores, detail_limit)))
+        if missing_stores:
+            lines.append("Missing stores: " + ", ".join(_limit_named_list(missing_stores, detail_limit)))
+    else:
+        lines.append("Dropdown was unchanged since the previous run.")
+
+    live_only_store_names = discovery.get("live_only_store_names", [])
+    if live_only_store_names:
+        lines.append("Live-only stores: " + ", ".join(_limit_named_list(live_only_store_names, detail_limit)))
+
+    return lines
+
+
+def build_failure_digest_lines(summary: Mapping[str, object], digest_limit: int = 5) -> list[str]:
+    failure_digest = summary.get("failure_digest", [])
+    if not failure_digest:
+        return ["No issues were recorded during this run."]
+
+    lines = []
+    for digest_entry in failure_digest[:digest_limit]:
+        line = (
+            f"{digest_entry['label']}: {digest_entry['events']} event(s), "
+            f"{digest_entry['terminal']} terminal, "
+            f"{digest_entry['affected_sources']} affected source(s)"
+        )
+        top_reason = str(digest_entry.get("top_reason", "")).strip()
+        if top_reason:
+            line += f"; top reason: {top_reason}"
+        lines.append(line)
+    return lines
+
+
+def build_github_step_summary_markdown(
+    summary: Mapping[str, object],
+    gate_reason: str = "",
+    gate_hour: str = "",
+) -> str:
+    lines = ["## Scraper Run Summary", ""]
+
+    if gate_reason:
+        lines.extend(
+            [
+                "### Gate",
+                "",
+                f"- Gate reason: `{gate_reason}`",
+            ]
+        )
+        if gate_hour and gate_hour != "manual":
+            lines.append(f"- Current London hour: `{gate_hour}`")
+        lines.append("")
+
+    stores = summary.get("stores", {})
+    retries = summary.get("retries", {})
+    collection = summary.get("collection_metrics", {})
+
+    lines.extend(
+        [
+            "### Overview",
+            "",
+            f"- Status: `{summary.get('status', 'unknown')}`",
+            f"- Detail: {summary.get('status_detail', 'n/a')}",
+            f"- Trigger: `{summary.get('trigger', 'unknown')}`",
+            f"- Duration: `{summary.get('elapsed_seconds', 0)}s`",
+            f"- Successful submissions: `{stores.get('successful_submissions', 0)}` / `{stores.get('total', 0)}`",
+            f"- Terminal failures: `{stores.get('failed', 0)}`",
+            f"- Retries: `{retries.get('total', 0)}` across `{retries.get('stores', 0)}` store(s)",
+            f"- Auth state: `{summary.get('auth', {}).get('state', 'unknown')}`",
+            "",
+            "### Dropdown",
+            "",
+        ]
+    )
+
+    dropdown_lines = build_dropdown_change_lines(summary)
+    if dropdown_lines:
+        for dropdown_line in dropdown_lines:
+            lines.append(f"- {dropdown_line}")
+    else:
+        lines.append("- Live dropdown data was not captured for this run.")
+    lines.append("")
+
+    fastest = collection.get("fastest_store")
+    slowest = collection.get("slowest_store")
+    if fastest or slowest:
+        lines.extend(["### Timing", ""])
+        if fastest:
+            lines.append(f"- Fastest store: `{fastest['store']}` in `{fastest['seconds']}s`")
+        if slowest:
+            lines.append(f"- Slowest store: `{slowest['store']}` in `{slowest['seconds']}s`")
+        lines.append("")
+
+    lines.extend(["### Failure Digest", ""])
+    for digest_line in build_failure_digest_lines(summary):
+        lines.append(f"- {digest_line}")
+    lines.append("")
+
+    recent_failures = summary.get("failure_summary", {}).get("recent_failures", [])
+    if recent_failures:
+        lines.extend(["### Recent Failures", ""])
+        for failure in recent_failures:
+            lines.append(f"- {failure}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def build_run_summary(state) -> dict[str, object]:
     finished_at = state.run_finished_at or datetime.now(state.run_started_at.tzinfo)
     started_at = state.run_started_at
     elapsed_seconds = max((finished_at - started_at).total_seconds(), 0.0)
     failure_summary = summarize_failure_events(state.failure_events)
+    failure_digest = build_failure_digest(state.failure_events)
 
     collection_times = state.metrics["collection_times"]
     submission_times = state.metrics["submission_times"]
@@ -119,6 +321,22 @@ def build_run_summary(state) -> dict[str, object]:
             "template_available_at_start": state.cache_template_available_at_start,
             "merchant_id_count_at_start": state.cache_merchant_ids_at_start,
         },
+        "discovery": {
+            "live_dropdown_stores": state.live_dropdown_store_count,
+            "matched_configured": state.live_dropdown_matched_configured_count,
+            "live_only": state.live_dropdown_live_only_count,
+            "live_only_store_names": list(state.live_dropdown_live_only_store_names),
+            "skipped_configured": state.live_dropdown_skipped_configured_count,
+            "discovery_attempt": state.live_dropdown_discovery_attempt,
+            "changes": {
+                "previous_count": len(state.previous_live_dropdown_store_names),
+                "current_count": len(state.current_live_dropdown_store_names),
+                "new_count": len(state.live_dropdown_new_stores),
+                "missing_count": len(state.live_dropdown_missing_stores),
+                "new_stores": list(state.live_dropdown_new_stores),
+                "missing_stores": list(state.live_dropdown_missing_stores),
+            },
+        },
         "collection_metrics": {
             "average_seconds": round(avg_collection_seconds, 3),
             "p95_seconds": round(p95_collection_seconds, 3),
@@ -133,6 +351,7 @@ def build_run_summary(state) -> dict[str, object]:
             "units": state.metrics["total_units"],
         },
         "failure_summary": failure_summary,
+        "failure_digest": failure_digest,
     }
 
 

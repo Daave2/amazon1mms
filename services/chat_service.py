@@ -17,7 +17,8 @@ from core.config import (
 )
 from core.logger import app_logger
 from core.reporting import (
-    FAILURE_CATEGORY_LABELS,
+    build_dropdown_change_lines,
+    build_failure_digest_lines,
     build_run_summary,
 )
 from core.state import ScraperState
@@ -405,16 +406,17 @@ def _build_discovery_text(state: ScraperState, total_stores: int) -> str:
     return " • ".join(discovery_bits)
 
 
-def _build_failure_lines(counter_map: dict[str, int], label_map: dict[str, str] | None = None) -> list[str]:
-    if not counter_map:
-        return []
-
-    sorted_items = sorted(counter_map.items(), key=lambda item: (-item[1], item[0]))
-    lines = []
-    for key, count in sorted_items[:5]:
-        label = label_map.get(key, _humanize_token(key)) if label_map else key
-        lines.append(f"{label}: {count}")
-    return lines
+def _section_from_lines(header: str, lines: list[str]) -> dict[str, object]:
+    return {
+        "header": header,
+        "widgets": [
+            {
+                "textParagraph": {
+                    "text": _format_html_lines(lines),
+                }
+            }
+        ],
+    }
 
 
 def _build_timing_text(store_timing: dict[str, object] | None) -> str:
@@ -597,52 +599,38 @@ def build_job_summary_payload(state: ScraperState, duration: float | None = None
             }
         )
 
+    dropdown_change_lines = build_dropdown_change_lines(summary)
+    if dropdown_change_lines:
+        sections.append(_section_from_lines("Dropdown Changes", dropdown_change_lines))
+
     if issue_total:
-        failure_summary = summary["failure_summary"]
-        category_lines = _build_failure_lines(
-            failure_summary["category_counts"],
-            FAILURE_CATEGORY_LABELS,
-        )
-        reason_lines = _build_failure_lines(failure_summary["reason_counts"])
-        recent_lines = list(failure_summary["recent_failures"])
-        if failure_summary["overflow_count"]:
-            recent_lines.append(f"...and {failure_summary['overflow_count']} more")
+        failure_digest_lines = build_failure_digest_lines(summary)
+        recent_lines = list(summary["failure_summary"]["recent_failures"])
+        if summary["failure_summary"]["overflow_count"]:
+            recent_lines.append(f"...and {summary['failure_summary']['overflow_count']} more")
 
-        issue_widgets = [
+        sections.append(
             {
-                "decoratedText": {
-                    "topLabel": "Issue Totals",
-                    "text": f"{issue_total} total • {terminal_failures} terminal • {non_terminal_events} non-terminal",
-                    "startIcon": {"knownIcon": "DESCRIPTION"},
-                }
+                "header": "Failure Digest",
+                "widgets": [
+                    {
+                        "decoratedText": {
+                            "topLabel": "Issue Totals",
+                            "text": f"{issue_total} total • {terminal_failures} terminal • {non_terminal_events} non-terminal",
+                            "startIcon": {"knownIcon": "DESCRIPTION"},
+                        }
+                    },
+                    {
+                        "textParagraph": {
+                            "text": _format_html_lines(failure_digest_lines),
+                        }
+                    },
+                ],
             }
-        ]
-        if category_lines:
-            issue_widgets.append(
-                {
-                    "textParagraph": {
-                        "text": f"<b>By Category</b><br>{_format_html_lines(category_lines)}",
-                    }
-                }
-            )
-        if reason_lines:
-            issue_widgets.append(
-                {
-                    "textParagraph": {
-                        "text": f"<b>Top Reasons</b><br>{_format_html_lines(reason_lines)}",
-                    }
-                }
-            )
-        if recent_lines:
-            issue_widgets.append(
-                {
-                    "textParagraph": {
-                        "text": f"<b>Recent Events</b><br>{_format_html_lines(recent_lines)}",
-                    }
-                }
-            )
+        )
 
-        sections.append({"header": "Issues", "widgets": issue_widgets})
+        if recent_lines:
+            sections.append(_section_from_lines("Recent Events", recent_lines))
 
     return {
         "cardsV2": [
