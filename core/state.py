@@ -8,11 +8,20 @@ from core.config import DISCOVERY_CACHE_FILE, FAST_PATH_MAX_CONCURRENCY, LOCAL_T
 from core.logger import app_logger
 
 
+def _attach_local_timezone(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value
+    if hasattr(LOCAL_TIMEZONE, "localize"):
+        return LOCAL_TIMEZONE.localize(value)
+    return value.replace(tzinfo=LOCAL_TIMEZONE)
+
+
 class CacheManager:
     def __init__(self):
         self.api_url_template = None
         self.merchant_id_cache = {}
         self.live_dropdown_store_names: list[str] = []
+        self.last_updated_at = None
         self.lock = asyncio.Lock()
 
     def load(self):
@@ -23,17 +32,25 @@ class CacheManager:
                     self.api_url_template = data.get("template")
                     self.merchant_id_cache.update(data.get("merchant_ids", {}))
                     self.live_dropdown_store_names = sorted(data.get("live_dropdown_store_names", []))
+                    last_updated = data.get("last_updated")
+                    if last_updated:
+                        parsed_last_updated = datetime.fromisoformat(last_updated)
+                        self.last_updated_at = _attach_local_timezone(parsed_last_updated)
+                    else:
+                        self.last_updated_at = None
                     app_logger.info(f"Loaded {len(self.merchant_id_cache)} discovered IDs from cache.")
             except Exception as e:
                 app_logger.warning(f"Failed to load discovery cache: {e}")
+                self.last_updated_at = None
 
     async def save(self):
         async with self.lock:
+            self.last_updated_at = datetime.now(LOCAL_TIMEZONE)
             data = {
                 "template": self.api_url_template,
                 "merchant_ids": self.merchant_id_cache,
                 "live_dropdown_store_names": self.live_dropdown_store_names,
-                "last_updated": datetime.now(LOCAL_TIMEZONE).isoformat(),
+                "last_updated": self.last_updated_at.isoformat(),
             }
             try:
                 os.makedirs(os.path.dirname(DISCOVERY_CACHE_FILE), exist_ok=True)
@@ -92,6 +109,8 @@ class ScraperState:
         self.current_live_dropdown_store_names: list[str] = []
         self.live_dropdown_new_stores: list[str] = []
         self.live_dropdown_missing_stores: list[str] = []
+        self.live_dropdown_refresh_mode = ""
+        self.live_dropdown_refresh_reason = ""
         self.job_summary_posted = False
         self.fast_path_eligible_at_start = 0
         self.ui_routed_at_start = 0

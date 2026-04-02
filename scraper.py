@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psutil
 from playwright.async_api import Browser, async_playwright
@@ -17,7 +17,9 @@ from core.config import (
     CPU_LOWER_THRESHOLD,
     CPU_UPPER_THRESHOLD,
     DEBUG_MODE,
+    DROPDOWN_REFRESH_MAX_AGE_DAYS,
     FAST_PATH_MAX_CONCURRENCY,
+    FORCE_DROPDOWN_DISCOVERY,
     INITIAL_CONCURRENCY,
     LOCAL_TIMEZONE,
     MEM_UPPER_THRESHOLD,
@@ -208,13 +210,132 @@ def _pick_best_configured_candidate(
     return None
 
 
+def _attach_local_timezone(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value
+    if hasattr(LOCAL_TIMEZONE, "localize"):
+        return LOCAL_TIMEZONE.localize(value)
+    return value.replace(tzinfo=LOCAL_TIMEZONE)
+
+
+def should_refresh_live_dropdown(
+    state: ScraperState,
+    *,
+    now: datetime | None = None,
+    force_refresh: bool | None = None,
+) -> tuple[bool, str, bool]:
+    if force_refresh is None:
+        force_refresh = FORCE_DROPDOWN_DISCOVERY
+    if now is None:
+        now = datetime.now(LOCAL_TIMEZONE)
+
+    if force_refresh:
+        return True, "manual_override", True
+    if not state.previous_live_dropdown_store_names:
+        return True, "missing_cached_snapshot", True
+    if state.cache.last_updated_at is None:
+        return True, "missing_cache_timestamp", False
+
+    last_updated_at = _attach_local_timezone(state.cache.last_updated_at)
+
+    cache_age = now - last_updated_at
+    if cache_age >= timedelta(days=DROPDOWN_REFRESH_MAX_AGE_DAYS):
+        return True, "weekly_refresh_due", False
+    return False, "cached_snapshot_fresh", False
+
+
+def _apply_dropdown_selection_state(
+    state: ScraperState,
+    available_stores: list[dict[str, str]],
+    filtered_stores: list[dict[str, str]],
+    skipped_stores: list[dict[str, str]],
+    *,
+    refresh_mode: str,
+    refresh_reason: str,
+    discovery_attempt: str,
+):
+    current_live_store_names = sorted({store["store_name"] for store in available_stores})
+    previous_live_store_names = sorted(set(state.previous_live_dropdown_store_names))
+    current_live_store_name_set = set(current_live_store_names)
+    previous_live_store_name_set = set(previous_live_store_names)
+
+    state.live_dropdown_refresh_mode = refresh_mode
+    state.live_dropdown_refresh_reason = refresh_reason
+    state.current_live_dropdown_store_names = current_live_store_names
+    state.live_dropdown_new_stores = sorted(current_live_store_name_set - previous_live_store_name_set)
+    state.live_dropdown_missing_stores = sorted(previous_live_store_name_set - current_live_store_name_set)
+    state.live_dropdown_discovery_attempt = discovery_attempt
+
+    matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
+    live_only_count = len(filtered_stores) - matched_configured_count
+    live_only_store_names = [
+        store["store_name"]
+        for store in filtered_stores
+        if not store.get("matched_from_configured")
+    ]
+    state.live_dropdown_store_count = len(filtered_stores)
+    state.live_dropdown_matched_configured_count = matched_configured_count
+    state.live_dropdown_live_only_count = live_only_count
+    state.live_dropdown_live_only_store_names = live_only_store_names
+    state.live_dropdown_skipped_configured_count = len(skipped_stores)
+
+
+def load_cached_dropdown_stores(
+    urls_data: list[dict[str, str]],
+    state: ScraperState,
+    refresh_reason: str,
+) -> list[dict[str, str]]:
+    app_logger.info(
+        "Skipping live dropdown discovery for this run; using cached live dropdown snapshot "
+        f"({len(state.previous_live_dropdown_store_names)} store(s), reason={refresh_reason})."
+    )
+
+    cached_available_stores = [
+        {
+            "store_name": store_name,
+            "normalized_name": resolve_dropdown_name(store_name),
+            "merchant_id": "",
+        }
+        for store_name in state.previous_live_dropdown_store_names
+    ]
+    filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, cached_available_stores)
+    _apply_dropdown_selection_state(
+        state,
+        cached_available_stores,
+        filtered_stores,
+        skipped_stores,
+        refresh_mode="cached",
+        refresh_reason=refresh_reason,
+        discovery_attempt="cached-snapshot",
+    )
+
+    app_logger.info(
+        f"Cached dropdown queue contains {len(filtered_stores)} store(s): "
+        f"{state.live_dropdown_matched_configured_count} matched configured row(s), "
+        f"{state.live_dropdown_live_only_count} live-only row(s)."
+    )
+    if skipped_stores:
+        skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
+        suffix = "..." if len(skipped_stores) > 10 else ""
+        app_logger.warning(
+            f"Ignoring {len(skipped_stores)} configured store(s) not present in the cached live dropdown snapshot: "
+            f"{skipped_names}{suffix}"
+        )
+
+    return filtered_stores
+
+
 async def load_live_dropdown_stores(
     browser: Browser,
     storage_template: dict,
     urls_data: list[dict[str, str]],
     state: ScraperState,
+    refresh_reason: str,
 ) -> list[dict[str, str]]:
-    app_logger.info("Discovering live store list from the dashboard dropdown before queueing stores.")
+    app_logger.info(
+        "Refreshing live store list from the dashboard dropdown before queueing stores "
+        f"(reason={refresh_reason})."
+    )
 
     discovery_attempts = [
         ("fast-load", True, "load"),
@@ -258,44 +379,33 @@ async def load_live_dropdown_stores(
 
     filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
 
-    current_live_store_names = sorted({store["store_name"] for store in available_stores})
-    previous_live_store_names = sorted(set(state.previous_live_dropdown_store_names))
-    current_live_store_name_set = set(current_live_store_names)
-    previous_live_store_name_set = set(previous_live_store_names)
+    _apply_dropdown_selection_state(
+        state,
+        available_stores,
+        filtered_stores,
+        skipped_stores,
+        refresh_mode="live",
+        refresh_reason=refresh_reason,
+        discovery_attempt=state.live_dropdown_discovery_attempt,
+    )
 
-    state.current_live_dropdown_store_names = current_live_store_names
-    state.live_dropdown_new_stores = sorted(current_live_store_name_set - previous_live_store_name_set)
-    state.live_dropdown_missing_stores = sorted(previous_live_store_name_set - current_live_store_name_set)
-
-    cache_updated = False
+    cache_updated = True
     for store in filtered_stores:
         merchant_id = store.get("merchant_id", "").strip()
         if merchant_id and state.cache.merchant_id_cache.get(store["store_name"]) != merchant_id:
             state.cache.merchant_id_cache[store["store_name"]] = merchant_id
             cache_updated = True
 
-    if current_live_store_names != state.cache.live_dropdown_store_names:
-        state.cache.live_dropdown_store_names = current_live_store_names
+    if state.current_live_dropdown_store_names != state.cache.live_dropdown_store_names:
+        state.cache.live_dropdown_store_names = state.current_live_dropdown_store_names
         cache_updated = True
 
     if cache_updated:
         await state.cache.save()
-
-    matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
-    live_only_count = len(filtered_stores) - matched_configured_count
-    live_only_store_names = [
-        store["store_name"]
-        for store in filtered_stores
-        if not store.get("matched_from_configured")
-    ]
-    state.live_dropdown_store_count = len(filtered_stores)
-    state.live_dropdown_matched_configured_count = matched_configured_count
-    state.live_dropdown_live_only_count = live_only_count
-    state.live_dropdown_live_only_store_names = live_only_store_names
-    state.live_dropdown_skipped_configured_count = len(skipped_stores)
     app_logger.info(
         f"Live dropdown queue contains {len(filtered_stores)} store(s): "
-        f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
+        f"{state.live_dropdown_matched_configured_count} matched configured row(s), "
+        f"{state.live_dropdown_live_only_count} live-only row(s)."
     )
     if state.live_dropdown_new_stores:
         app_logger.info(
@@ -616,10 +726,42 @@ async def process_urls(browser: Browser, state: ScraperState):
     with open(STORAGE_STATE) as f:
         storage_template = json.load(f)
 
-    urls_data = await load_live_dropdown_stores(browser, storage_template, urls_data, state)
+    refresh_live_dropdown, refresh_reason, refresh_required = should_refresh_live_dropdown(state)
+    if refresh_live_dropdown:
+        try:
+            urls_data = await load_live_dropdown_stores(
+                browser,
+                storage_template,
+                urls_data,
+                state,
+                refresh_reason,
+            )
+        except Exception:
+            if refresh_required:
+                raise
+            app_logger.warning(
+                "Live dropdown refresh failed; falling back to cached live dropdown snapshot "
+                f"(reason={refresh_reason})."
+            )
+            await state.record_issue(
+                f"Live dropdown refresh failed; used cached snapshot instead ({refresh_reason})",
+                asyncio.get_running_loop().time(),
+                category="general",
+            )
+            urls_data = load_cached_dropdown_stores(urls_data, state, "refresh_failed_used_cached_snapshot")
+    else:
+        urls_data = load_cached_dropdown_stores(urls_data, state, refresh_reason)
+
     if not urls_data:
-        app_logger.error("No configured stores are currently listed in the live dropdown. Aborting job.")
-        state.set_job_status("aborted_no_stores", "No configured stores were present in the live dropdown")
+        if state.live_dropdown_refresh_mode == "cached":
+            app_logger.error("No configured stores are present in the cached live dropdown snapshot. Aborting job.")
+            state.set_job_status(
+                "aborted_no_stores",
+                "No configured stores were present in the cached live dropdown snapshot",
+            )
+        else:
+            app_logger.error("No configured stores are currently listed in the live dropdown. Aborting job.")
+            state.set_job_status("aborted_no_stores", "No configured stores were present in the live dropdown")
         return
 
     fast_path_items, ui_items = route_store_work_items(urls_data, state)

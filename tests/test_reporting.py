@@ -33,6 +33,8 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     state.live_dropdown_store_count = 2
     state.live_dropdown_matched_configured_count = 2
     state.current_live_dropdown_store_names = ["Belle Vale", "Carterton"]
+    state.live_dropdown_refresh_mode = "live"
+    state.live_dropdown_refresh_reason = "weekly_refresh_due"
 
     _patch_reporting_paths(monkeypatch, tmp_path)
     summary = reporting.write_runtime_reports(state)
@@ -41,6 +43,8 @@ def test_write_runtime_reports_for_all_success_run(tmp_path, monkeypatch):
     assert summary["stores"]["successful_submissions"] == 2
     assert summary["discovery_cache"]["template_available_at_start"] is True
     assert summary["discovery"]["live_dropdown_stores"] == 2
+    assert summary["discovery"]["refresh_mode"] == "live"
+    assert summary["discovery"]["refresh_reason"] == "weekly_refresh_due"
     assert summary["routing"] == {
         "fast_path_eligible_at_start": 1,
         "ui_routed_at_start": 1,
@@ -181,6 +185,34 @@ def test_build_dropdown_change_and_failure_digest_lines():
     assert failure_digest_lines == [
         "API Fast Path: 3 event(s), 1 terminal, 2 affected source(s); top reason: API returned 504",
         "Submission: 1 event(s), 1 terminal, 1 affected source(s); top reason: HTTP Submit Fail 500",
+    ]
+
+
+def test_build_dropdown_change_lines_for_cached_snapshot_run():
+    summary = {
+        "discovery": {
+            "live_dropdown_stores": 85,
+            "matched_configured": 84,
+            "live_only": 1,
+            "live_only_store_names": ["Oxford"],
+            "refresh_mode": "cached",
+            "refresh_reason": "cached_snapshot_fresh",
+            "changes": {
+                "new_count": 0,
+                "missing_count": 0,
+                "new_stores": [],
+                "missing_stores": [],
+            },
+        }
+    }
+
+    dropdown_lines = reporting.build_dropdown_change_lines(summary)
+
+    assert dropdown_lines == [
+        "Live dropdown refresh was skipped for this run; using the cached snapshot because the cached snapshot is newer than 7 days.",
+        "Cached snapshot queued 85 stores, with 84 configured matches and 1 live-only store.",
+        "Dropdown changes were not rechecked in this run.",
+        "Live-only stores: Oxford",
     ]
 
 

@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # Concurrency
     initial_concurrency: int = Field(default=30)
     num_form_submitters: int = Field(default=2)
+    dropdown_refresh_max_age_days: int = Field(default=7, alias="DROPDOWN_REFRESH_MAX_AGE_DAYS")
+    force_dropdown_discovery: bool = Field(default=False, alias="FORCE_DROPDOWN_DISCOVERY")
 
     # Auto Concurrency config
     auto_enabled: bool = Field(default=True)
@@ -82,6 +84,8 @@ FORM_POST_URL = settings.form_post_url
 
 INITIAL_CONCURRENCY = settings.initial_concurrency
 NUM_FORM_SUBMITTERS = settings.num_form_submitters
+DROPDOWN_REFRESH_MAX_AGE_DAYS = settings.dropdown_refresh_max_age_days
+FORCE_DROPDOWN_DISCOVERY = settings.force_dropdown_discovery
 
 AUTO_ENABLED = settings.auto_enabled
 AUTO_MIN_CONCURRENCY = settings.auto_min_concurrency

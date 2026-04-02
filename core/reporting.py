@@ -15,6 +15,15 @@ FAILURE_CATEGORY_LABELS = {
     "general": "General",
 }
 
+DISCOVERY_REFRESH_REASON_LABELS = {
+    "cached_snapshot_fresh": "the cached snapshot is newer than 7 days",
+    "manual_override": "a manual refresh was requested",
+    "missing_cached_snapshot": "no cached live-dropdown snapshot exists yet",
+    "missing_cache_timestamp": "the cached snapshot has no refresh timestamp",
+    "weekly_refresh_due": "the cached snapshot is at least 7 days old",
+    "refresh_failed_used_cached_snapshot": "the scheduled refresh failed and the cached snapshot was reused",
+}
+
 RUN_SUMMARY_FILE = os.path.join(OUTPUT_DIR, "run_summary.json")
 FAILURE_EVENTS_FILE = os.path.join(OUTPUT_DIR, "failure_events.json")
 
@@ -117,8 +126,11 @@ def _limit_named_list(values: Iterable[str], limit: int = 5) -> list[str]:
 def build_dropdown_change_lines(summary: Mapping[str, object], detail_limit: int = 5) -> list[str]:
     discovery = summary.get("discovery", {})
     changes = discovery.get("changes", {})
+    refresh_mode = str(discovery.get("refresh_mode", "")).strip()
+    refresh_reason = str(discovery.get("refresh_reason", "")).strip()
     if (
-        int(discovery.get("live_dropdown_stores", 0)) == 0
+        not refresh_mode
+        and int(discovery.get("live_dropdown_stores", 0)) == 0
         and int(discovery.get("matched_configured", 0)) == 0
         and int(discovery.get("live_only", 0)) == 0
         and int(changes.get("previous_count", 0)) == 0
@@ -128,26 +140,42 @@ def build_dropdown_change_lines(summary: Mapping[str, object], detail_limit: int
     ):
         return []
 
-    lines = [
-        (
-            f"Live dropdown queued {discovery.get('live_dropdown_stores', 0)} stores, "
-            f"with {discovery.get('matched_configured', 0)} configured matches and "
-            f"{discovery.get('live_only', 0)} live-only {_pluralize('store', int(discovery.get('live_only', 0)))}."
-        )
-    ]
+    reason_label = DISCOVERY_REFRESH_REASON_LABELS.get(refresh_reason, refresh_reason.replace("_", " "))
 
-    new_count = int(changes.get("new_count", 0))
-    missing_count = int(changes.get("missing_count", 0))
-    if new_count or missing_count:
-        lines.append(f"Dropdown changed since last run: {new_count} new and {missing_count} missing.")
-        new_stores = changes.get("new_stores", [])
-        missing_stores = changes.get("missing_stores", [])
-        if new_stores:
-            lines.append("New stores: " + ", ".join(_limit_named_list(new_stores, detail_limit)))
-        if missing_stores:
-            lines.append("Missing stores: " + ", ".join(_limit_named_list(missing_stores, detail_limit)))
+    if refresh_mode == "cached":
+        lines = [
+            (
+                "Live dropdown refresh was skipped for this run; "
+                f"using the cached snapshot because {reason_label}."
+            ),
+            (
+                f"Cached snapshot queued {discovery.get('live_dropdown_stores', 0)} stores, "
+                f"with {discovery.get('matched_configured', 0)} configured matches and "
+                f"{discovery.get('live_only', 0)} live-only {_pluralize('store', int(discovery.get('live_only', 0)))}."
+            ),
+            "Dropdown changes were not rechecked in this run.",
+        ]
     else:
-        lines.append("Dropdown was unchanged since the previous run.")
+        lines = [
+            (
+                f"Live dropdown queued {discovery.get('live_dropdown_stores', 0)} stores, "
+                f"with {discovery.get('matched_configured', 0)} configured matches and "
+                f"{discovery.get('live_only', 0)} live-only {_pluralize('store', int(discovery.get('live_only', 0)))}."
+            )
+        ]
+
+        new_count = int(changes.get("new_count", 0))
+        missing_count = int(changes.get("missing_count", 0))
+        if new_count or missing_count:
+            lines.append(f"Dropdown changed since last run: {new_count} new and {missing_count} missing.")
+            new_stores = changes.get("new_stores", [])
+            missing_stores = changes.get("missing_stores", [])
+            if new_stores:
+                lines.append("New stores: " + ", ".join(_limit_named_list(new_stores, detail_limit)))
+            if missing_stores:
+                lines.append("Missing stores: " + ", ".join(_limit_named_list(missing_stores, detail_limit)))
+        else:
+            lines.append("Dropdown was unchanged since the previous run.")
 
     live_only_store_names = discovery.get("live_only_store_names", [])
     if live_only_store_names:
@@ -352,6 +380,8 @@ def build_run_summary(state) -> dict[str, object]:
             "live_only_store_names": list(state.live_dropdown_live_only_store_names),
             "skipped_configured": state.live_dropdown_skipped_configured_count,
             "discovery_attempt": state.live_dropdown_discovery_attempt,
+            "refresh_mode": state.live_dropdown_refresh_mode,
+            "refresh_reason": state.live_dropdown_refresh_reason,
             "changes": {
                 "previous_count": len(state.previous_live_dropdown_store_names),
                 "current_count": len(state.current_live_dropdown_store_names),

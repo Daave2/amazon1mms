@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -156,6 +157,12 @@ class FakeBrowser:
         return context
 
 
+def london_datetime(year, month, day, hour=0, minute=0):
+    if hasattr(scraper.LOCAL_TIMEZONE, "localize"):
+        return scraper.LOCAL_TIMEZONE.localize(datetime(year, month, day, hour, minute))
+    return datetime(year, month, day, hour, minute, tzinfo=scraper.LOCAL_TIMEZONE)
+
+
 def test_filter_stores_to_live_dropdown_queues_all_live_stores_and_uses_live_merchant_ids():
     urls_data = [
         {"store_name": "Belle Vale Morrisons", "merchant_id": "", "marketplace_id": "", "dropdown_name": "Belle Vale"},
@@ -280,6 +287,73 @@ def test_should_not_bypass_auto_concurrency_when_ui_work_exists():
     state.ui_routed_at_start = 5
 
     assert scraper.should_bypass_auto_concurrency(state) is False
+
+
+def test_should_refresh_live_dropdown_when_manual_override_is_requested():
+    state = ScraperState()
+    state.previous_live_dropdown_store_names = ["Belle Vale"]
+    state.cache.last_updated_at = london_datetime(2026, 4, 1, 9, 0)
+
+    should_refresh, reason, required = scraper.should_refresh_live_dropdown(
+        state,
+        now=london_datetime(2026, 4, 2, 9, 0),
+        force_refresh=True,
+    )
+
+    assert (should_refresh, reason, required) == (True, "manual_override", True)
+
+
+def test_should_skip_live_dropdown_when_cached_snapshot_is_fresh():
+    state = ScraperState()
+    state.previous_live_dropdown_store_names = ["Belle Vale"]
+    state.cache.last_updated_at = london_datetime(2026, 4, 1, 9, 0)
+
+    should_refresh, reason, required = scraper.should_refresh_live_dropdown(
+        state,
+        now=london_datetime(2026, 4, 2, 9, 0),
+        force_refresh=False,
+    )
+
+    assert (should_refresh, reason, required) == (False, "cached_snapshot_fresh", False)
+
+
+def test_should_refresh_live_dropdown_when_cached_snapshot_is_week_old():
+    state = ScraperState()
+    state.previous_live_dropdown_store_names = ["Belle Vale"]
+    now = london_datetime(2026, 4, 2, 9, 0)
+    state.cache.last_updated_at = now - timedelta(days=7)
+
+    should_refresh, reason, required = scraper.should_refresh_live_dropdown(
+        state,
+        now=now,
+        force_refresh=False,
+    )
+
+    assert (should_refresh, reason, required) == (True, "weekly_refresh_due", False)
+
+
+def test_load_cached_dropdown_stores_uses_cached_snapshot_for_queue_filtering():
+    state = ScraperState()
+    state.previous_live_dropdown_store_names = ["Belle Vale", "Oxford"]
+
+    filtered = scraper.load_cached_dropdown_stores(
+        [
+            {"store_name": "Belle Vale Morrisons", "dropdown_name": "Belle Vale", "merchant_id": "", "marketplace_id": ""},
+            {"store_name": "Carterton Morrisons", "dropdown_name": "Carterton", "merchant_id": "", "marketplace_id": ""},
+            {"store_name": "Morrisons Welling", "dropdown_name": "Welling", "merchant_id": "", "marketplace_id": ""},
+        ],
+        state,
+        "cached_snapshot_fresh",
+    )
+
+    assert [store["store_name"] for store in filtered] == [
+        "Belle Vale Morrisons",
+        "Carterton Morrisons",
+    ]
+    assert state.live_dropdown_refresh_mode == "cached"
+    assert state.live_dropdown_refresh_reason == "cached_snapshot_fresh"
+    assert state.live_dropdown_discovery_attempt == "cached-snapshot"
+    assert state.live_dropdown_store_count == 2
 
 
 @pytest.mark.asyncio

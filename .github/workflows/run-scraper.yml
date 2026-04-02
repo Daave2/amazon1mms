@@ -7,6 +7,12 @@ name: Run Playwright Scraper (1MMS)
 on:
   # 1. MANUAL TRIGGER: Allows you to run the scraper anytime from the "Actions" tab in GitHub.
   workflow_dispatch:
+    inputs:
+      refresh_dropdown:
+        description: Refresh the live dropdown snapshot before queueing stores
+        required: false
+        default: false
+        type: boolean
 
   # 2. SCHEDULED RUNS:
   #    Changed from '0' to '15' to avoid GitHub's high load at the top of the hour.
@@ -25,6 +31,8 @@ env:
   # DEFINE YOUR TARGET UK HOURS HERE (24-hour format)
   # The main job will only run if the current UK hour is in this list.
   UK_TARGET_HOURS: '05 01 20'
+  # Refresh the live dropdown snapshot when the cached discovery data is at least this old.
+  DROPDOWN_REFRESH_MAX_AGE_DAYS: '7'
 
 jobs:
   # ==============================================================================
@@ -104,6 +112,7 @@ jobs:
       AUTO_MAX_CONCURRENCY: ${{ secrets.MAX_CONCURRENCY || 40 }}
       INITIAL_CONCURRENCY: ${{ secrets.INITIAL_CONCURRENCY || 25 }}
       NUM_FORM_SUBMITTERS: ${{ secrets.NUM_SUBMITTERS || 5 }}
+      FORCE_DROPDOWN_DISCOVERY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.refresh_dropdown == 'true' && 'true' || 'false' }}
 
     steps:
     - uses: actions/checkout@v4
