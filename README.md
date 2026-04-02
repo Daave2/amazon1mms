@@ -3,108 +3,244 @@
 ![Python](https://img.shields.io/badge/Python-3.11-blue.svg)
 ![Playwright](https://img.shields.io/badge/Playwright-Async-green.svg)
 
-A robust, highly concurrent, headless Playwright scraper. It safely bypasses Amazon's Google Workspace login restrictions to accurately aggregate store-level performance metrics (such as **Late Picks**, **UPH**, **Order Volume**, and **Cancellations**) directly from internal metric API endpoints and rendering UI panels, all without breaking on regional variation.
+This project is a headless, scheduled data pipeline for Amazon Seller Central.
+It logs into the 1MMS account, collects store-level performance metrics, normalizes the raw payloads, submits the results to Google Forms, and posts operational summaries to Google Chat.
 
----
+The main runtime is [`scraper.py`](./scraper.py). The scraper is optimized around three goals:
 
-## 📌 Features
+- reuse auth state so repeated runs do not re-login unless needed
+- prefer direct API collection over UI scraping whenever possible
+- keep throughput high without overwhelming the runner
 
-- **Pydantic Validation:** Employs strict, type-safe API schema parsing. If Amazon's `summationMetrics` JSON payloads change unexpectedly, the system fails fast logically rather than submitting corrupted 0.0 values.
-- **Fast-Path API Interception:** Skips slow UI rendering entirely for cached stores, directly pulling HTTP JSON metrics for maximum speed.
-- **Auto-Scaling Concurrency:** Automatically measures system CPU and Memory usage to dynamically scale worker counts up or down (between 1 and 40+), ensuring maximum throughput without crashing GitHub Actions instances.
-- **Google Chat Webhooks:** Dynamically engineers summary cards detailing the job execution, throughput, and error tracing directly into your Workspace Chat.
-- **Safe State Recovery:** Safely persists Playwright auth states (cookies) and Merchant ID discovery caches between runs, preventing repeated login friction or CAPTCHA triggers.
+## What The System Does
 
----
+- Loads stores from `urls.csv`
+- Reuses a persisted Playwright session from `state.json` when valid
+- Falls back to the Amazon login flow with OTP and account picker handling when needed
+- Learns and caches internal merchant IDs and reusable metrics endpoint templates
+- Collects metrics with a fast API path or a UI interception fallback
+- Validates and aggregates the response into one normalized store-level record
+- Submits each store record to Google Forms
+- Logs successful submissions locally and sends KPI updates to Google Chat
+- Posts a final job summary with throughput, retries, and failure analysis
 
-## 🏗️ System Architecture
-
-The application has been overhauled for extreme maintainability, strictly following a core-services separation.
+## Architecture At A Glance
 
 ```mermaid
-graph TD
-    A[GitHub Actions / Scheduler] -->|Starts Run| B(scraper.py)
-    B -->|Instantiates| C(Playwright Browser)
-    B -->|Boots Workers| D{Worker Pool}
+flowchart TD
+    Scheduler["GitHub Actions<br/>or local run"] --> Entrypoint["scraper.py<br/>job orchestrator"]
+    Entrypoint --> Config["core/config.py<br/>environment, constants, thresholds"]
+    Entrypoint --> State["core/state.py<br/>progress, retries, cache, chat batches"]
+    Entrypoint --> Browser["Playwright Chromium"]
 
-    subgraph "Services Layer"
-        D -->|Validates Session| E(auth_service.py)
-        D -->|Extracts Data| F(metrics_service.py)
-    end
-    
-    subgraph "Core Components"
-        F -->|Reads Schema| G(schemas.py)
-        F -->|Updates Progress| I(state.py)
-    end
+    Browser --> Session{"Valid saved session<br/>in state.json?"}
+    Session -->|Yes| Queue["Store queue<br/>from urls.csv"]
+    Session -->|No| Auth["services/auth_service.py<br/>login, OTP, account picker"]
+    Auth --> SavedAuth["state.json<br/>persisted storage state"]
+    SavedAuth --> Queue
 
-    F -->|Sends Result to Queue| J(forms_service.py)
-    J -->|HTTP POST| K[(Google Forms)]
-    
-    B -->|Finalizes Job| L(chat_service.py)
-    L -->|JSON Card Post| M[Google Chat]
+    Entrypoint --> Auto["auto_concurrency_manager<br/>CPU, memory, failure based throttling"]
+    Queue --> Workers["Browser worker pool"]
+    Auto --> Workers
+
+    Workers --> Metrics["services/metrics_service.py<br/>API fast path or UI fallback"]
+    Metrics --> Schemas["core/schemas.py<br/>Pydantic validation"]
+    Metrics --> Cache["output/discovery_cache.json<br/>merchant IDs and API template"]
+    Metrics --> SubmitQueue["Submission queue"]
+
+    SubmitQueue --> Forms["services/forms_service.py<br/>POST to Google Forms"]
+    Forms --> Logs["output/submissions.log<br/>output/submissions.jsonl"]
+    Forms --> ChatBatch["services/chat_service.py<br/>batched KPI cards"]
+    ChatBatch --> Chat["Google Chat webhook"]
+
+    Workers --> Summary["Final job summary"]
+    Forms --> Summary
+    Summary --> Chat
 ```
 
-### Component Breakdown
+## Single Store Processing Flow
 
-- `scraper.py` — The primary orchestrator. Bootstraps Chromium, creates the async workload pool, dynamically loads URLs, and waits for successful completion.
-- `core/config.py` — Defines configuration schemas (using `pydantic-settings`). Exits loudly if critical environment variables are missing.
-- `core/logger.py` — Handles rotating local file logging and automatic timezone localization (Europe/London).
-- `core/state.py` — A thread-safe container storing queue lengths, error messages, and dynamic state caches without utilizing unprotected globals.
-- `core/schemas.py` — Extremely strict `pydantic` models for mapping Amazon's HTTP JSON.
-- `services/auth_service.py` — Encapsulates the Google Bypass, email/password entry, and 1MMS Merchant picker selection loop.
-- `services/metrics_service.py` — Injects Amazon's internal APIs natively. Intercepts dashboard data or forces UI refreshes for target data collection iteratively.
-- `services/forms_service.py` — Transforms normalized metric objects and pushes POST requests to the downstream Google Forms spreadsheet hook asynchronously.
-- `services/chat_service.py` — Orchestrates dynamic Google Workspace Chat Cards.
+```mermaid
+flowchart LR
+    Store["Store from queue"] --> Cached{"Known merchant ID<br/>and API template?"}
+    Cached -->|Yes| FastAPI["Call metrics endpoint directly"]
+    Cached -->|No| Dashboard["Open dashboard and select store"]
 
----
+    Dashboard --> Refresh["Click Refresh and intercept metrics response"]
+    Refresh --> Learn["Capture merchant ID and endpoint template"]
+    Learn --> Parse["Validate and normalize payload"]
+    FastAPI --> Parse
+    Parse --> Aggregate["Aggregate shopper records into store totals"]
+    Aggregate --> Submit["Queue Google Forms submission"]
+    Submit --> Log["Write local logs and queue chat update"]
+```
 
-## 🚀 Setting Up Locally
+## End-To-End Runtime Flow
 
-You do not need to use `config.json` manually anymore; configuration has been migrated to standard environment variables.
+1. `scraper.py` loads configuration and store input.
+2. The discovery cache is loaded so the scraper can reuse known merchant IDs and API templates.
+3. The scraper checks whether the saved Playwright session in `state.json` is still valid.
+4. If the session is invalid, `auth_service.py` performs the login flow and writes a fresh `state.json`.
+5. The main process creates a store job queue, a submission queue, browser workers, form submitters, and the auto-concurrency manager.
+6. Each browser worker takes one store at a time and tries the direct API fast path first.
+7. If the fast path is unavailable, the worker opens the dashboard, selects the store from the dropdown, clicks `Refresh`, and captures the network response.
+8. `metrics_service.py` validates the payload with Pydantic models and converts it into a single normalized store record.
+9. `forms_service.py` submits the record to Google Forms, appends it to local CSV and JSONL logs, and hands it to `chat_service.py` for batched KPI reporting.
+10. When all stores are done, the scraper flushes pending chat batches, posts a final job summary, updates `urls.csv` with newly discovered merchant IDs, and shuts down.
 
-1. **Install Requirements:**
+## Component Guide
+
+| File | Responsibility |
+| --- | --- |
+| `scraper.py` | Main orchestration, session bootstrap, queue setup, worker lifecycle, adaptive concurrency, and finalization. |
+| `core/config.py` | Loads environment variables and defines runtime constants, thresholds, output paths, form mappings, and store name normalization rules. |
+| `core/state.py` | Holds shared in-memory state for progress, failures, retry stats, timing metrics, chat batching, and discovery cache persistence. |
+| `core/schemas.py` | Defines the Pydantic models used to validate Amazon metrics payloads. |
+| `core/logger.py` | Configures console and rotating file logging using the London timezone. |
+| `core/utils.py` | Shared helpers for name normalization, KPI formatting, and screenshot capture. |
+| `services/auth_service.py` | Amazon login, OTP generation, passkey bypass handling, and account picker automation. |
+| `services/metrics_service.py` | Store selection, endpoint discovery, API fast path, UI fallback, and metric aggregation. |
+| `services/forms_service.py` | Google Forms submission workers and write-ahead logging of successful rows. |
+| `services/chat_service.py` | Batched KPI cards during the run and a final operational summary after completion. |
+
+## Data Model And Persistence
+
+### Primary inputs
+
+- `urls.csv`: source of stores, merchant IDs, and marketplace IDs
+- environment variables: credentials, target URL, concurrency settings, and optional chat webhook
+
+### Persisted runtime state
+
+- `state.json`: Playwright storage state used to reuse authenticated sessions across runs
+- `output/discovery_cache.json`: discovered merchant IDs plus a reusable metrics API URL template
+- `urls.csv`: optionally backfilled with newly discovered merchant IDs after a run
+
+### Outputs
+
+- `output/submissions.log`: CSV log of successful downstream submissions
+- `output/submissions.jsonl`: JSONL log of successful downstream submissions
+- `app.log`: rotating application log
+- `output/*.png`: screenshots captured during failures for debugging
+- Google Forms rows: the normalized downstream metric destination
+- Google Chat cards: batched KPI updates and final summary cards
+
+## Metric Collection Strategy
+
+### Fast path
+
+If the scraper already knows a store's merchant ID and has a reusable endpoint template, it calls the metrics endpoint directly through Playwright's request client.
+This avoids dropdown interaction and makes subsequent runs much faster.
+
+### Discovery path
+
+If the fast path is not available, the scraper navigates to the dashboard, selects the target store from the UI, clicks `Refresh`, and waits for the metrics response.
+The response URL is then used to discover and cache both:
+
+- the merchant ID for that store
+- a reusable endpoint template for future direct API collection
+
+### Validation and aggregation
+
+Amazon sometimes returns a single summary object and sometimes returns a list of shopper-level records.
+When shopper-level records are returned, the scraper:
+
+- validates each record with Pydantic
+- filters to `MASTER` records when present
+- deduplicates shoppers using profile priority
+- computes store-level totals and derived rates such as `UPH`, `Late Picks`, `INF`, and `Item Found Rate`
+
+## Concurrency Model
+
+- Browser workers are created from `INITIAL_CONCURRENCY`
+- Form submission workers run independently from browser scraping
+- `auto_concurrency_manager` adjusts the allowed number of active browser workers based on CPU usage, memory usage, recent failure rate, and cooldown timing between changes
+
+This design keeps browser work and downstream submission decoupled while still protecting GitHub Actions runners from overload.
+
+## Integrations
+
+### Google Forms
+
+Successful store records are posted to a Google Form endpoint.
+The form URL and field mappings are currently defined in `core/config.py`.
+
+### Google Chat
+
+If `CHAT_WEBHOOK_URL` is configured, the scraper posts:
+
+- batched KPI cards during the run
+- a final completion summary with throughput, success rate, retries, slowest and fastest stores, and failure analysis
+
+If `CHAT_WEBHOOK_URL` is not configured, the scraper still runs normally and simply skips chat reporting.
+
+## Local Setup
+
+The main scraper is environment-driven.
+You do not need `config.json` for `scraper.py`.
+
+1. Install Python dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
-2. **Install Playwright Browsers:**
+
+2. Install Playwright Chromium:
+
    ```bash
-   playwright install chromium
+   python -m playwright install chromium
    ```
-3. **Configure Environment Variables:**
-   Create your environment configuration based on the example.
+
+3. Create a local environment file:
+
    ```bash
    cp .env.example .env
    ```
-   Open `.env` and fill out your Amazon credentials, target URLs, and Webhook IDs.
-4. **Execute:**
+
+4. Fill in the required Amazon credentials and runtime settings in `.env`.
+
+5. Run the scraper:
+
    ```bash
    python scraper.py
    ```
 
----
+## Environment Variables
 
-## ⚙️ Environment Variables Reference
+| Variable | Required | Purpose | Default |
+| --- | --- | --- | --- |
+| `DEBUG` | No | Run Playwright in headed mode for debugging | `false` |
+| `LOGIN_URL` | Yes | Amazon Seller Central sign-in URL | none |
+| `LOGIN_EMAIL` | Yes | Amazon account email | none |
+| `LOGIN_PASSWORD` | Yes | Amazon account password | none |
+| `OTP_SECRET_KEY` | Yes | TOTP secret used for 2FA generation | none |
+| `TARGET_URL` | No | Dashboard landing page used for session verification and navigation | Seller Central 1MMS dashboard URL |
+| `CHAT_WEBHOOK_URL` | No | Google Chat webhook for KPI and summary cards | empty |
+| `INITIAL_CONCURRENCY` | No | Initial number of browser workers | `30` |
+| `NUM_FORM_SUBMITTERS` | No | Number of submission workers for Google Forms | `2` |
+| `AUTO_ENABLED` | No | Enable automatic concurrency adjustment | `true` |
+| `AUTO_MIN_CONCURRENCY` | No | Minimum allowed active browser workers | `1` |
+| `AUTO_MAX_CONCURRENCY` | No | Maximum allowed active browser workers | `40` |
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `DEBUG` | Runs Playwright in headed mode (visible browser) if `true`. | `false` |
-| `LOGIN_EMAIL` | The Email address for the Amazon Account. | *Required* |
-| `LOGIN_PASSWORD` | The Password for the Amazon Account. | *Required* |
-| `OTP_SECRET_KEY` | PyOTP Generator secret to bypass Authenticator challenges. | *Required* |
-| `TARGET_URL` | The initial metric dashboard Playwright targets. | *Required* |
-| `CHAT_WEBHOOK_URL` | Google Chat Space Hook endpoint. | *Required* |
-| `INITIAL_CONCURRENCY` | Starting amount of workers for the pool. | `30` |
-| `NUM_FORM_SUBMITTERS` | Thread boundaries for the Google Form submitting loop. | `2` |
+See [`.env.example`](./.env.example) for a minimal local template.
 
----
+## GitHub Actions Operation
 
+The workflow in [`.github/workflows/run-scraper.yml`](./.github/workflows/run-scraper.yml) is the production scheduler for this scraper.
 
-## 🔄 GitHub Actions Workflows
+It runs every hour at `:15`, then gates the actual scrape so it only proceeds during the configured London hours in `UK_TARGET_HOURS`.
 
-This system is automatically scheduled natively inside `.github/workflows/run-scraper.yml`.
+The workflow also:
 
-The execution lifecycle consists of:
-1. `check-time`: A bash-script validating the current hour against `UK_TARGET_HOURS` to prevent off-hour spam.
-2. `scrape-and-submit`: Collects variables safely masked within the Github Secrets repository and maps them automatically onto the `scraper.py` execution via native execution wrappers.
+- installs Python and Playwright dependencies
+- restores cached discovery data and prior auth state from GitHub artifacts
+- runs `python scraper.py`
+- uploads logs, screenshots, discovery cache, and auth state back to GitHub artifacts
 
-The persistent state (like login cookie sessions and mid-discovery arrays) rotates across GitHub Artifacts automatically, retaining authentication history spanning multiple days.
+This artifact-based persistence is what allows the scraper to keep its auth state and fast-path cache across runs.
+
+## Repository Notes
+
+- The main runtime path is the environment-based `scraper.py` flow.
+- `config.json` and some helper scripts remain in the repo as troubleshooting artifacts from an older setup.
+- Files like `test_dropdown.py`, `test_account_picker.py`, and `test_woking.py` are targeted debugging or validation scripts rather than part of the production pipeline.
