@@ -359,10 +359,27 @@ def allocate_worker_counts(fast_path_store_count: int, ui_store_count: int) -> t
     return api_workers, ui_workers
 
 
+def should_bypass_auto_concurrency(state: ScraperState) -> bool:
+    return state.fast_path_eligible_at_start > 0 and state.ui_routed_at_start == 0
+
+
+def get_effective_auto_concurrency_bounds(state: ScraperState) -> tuple[int, int]:
+    effective_max = max(1, min(AUTO_MAX_CONCURRENCY, state.browser_worker_pool_size or AUTO_MAX_CONCURRENCY))
+    effective_min = min(AUTO_MIN_CONCURRENCY, effective_max)
+    return effective_min, effective_max
+
+
 async def auto_concurrency_manager(state: ScraperState):
     if not AUTO_ENABLED:
         return
-    app_logger.info(f"Auto-concurrency enabled with range {AUTO_MIN_CONCURRENCY}-{AUTO_MAX_CONCURRENCY}")
+    if should_bypass_auto_concurrency(state):
+        app_logger.info(
+            "Auto-concurrency bypassed for warm-cache all-fast-path run; worker mix is fixed at startup."
+        )
+        return
+
+    effective_min, effective_max = get_effective_auto_concurrency_bounds(state)
+    app_logger.info(f"Auto-concurrency enabled with range {effective_min}-{effective_max}")
     while True:
         now = asyncio.get_running_loop().time()
 
@@ -376,7 +393,7 @@ async def auto_concurrency_manager(state: ScraperState):
 
         if failure_rate > 0.05:
             if now - state.last_concurrency_change >= COOLDOWN_SECONDS:
-                state.concurrency_limit = max(AUTO_MIN_CONCURRENCY, int(state.concurrency_limit * 0.5))
+                state.concurrency_limit = max(effective_min, int(state.concurrency_limit * 0.5))
                 state.last_concurrency_change = now
                 app_logger.warning(
                     f"Auto-concurrency: THROTTLING DOWN to {state.concurrency_limit} due to high failure rate ({failure_rate:.1%})"
@@ -392,7 +409,7 @@ async def auto_concurrency_manager(state: ScraperState):
         if now - state.last_concurrency_change >= COOLDOWN_SECONDS:
             if (
                 cpu > CPU_UPPER_THRESHOLD or mem > MEM_UPPER_THRESHOLD
-            ) and state.concurrency_limit > AUTO_MIN_CONCURRENCY:
+            ) and state.concurrency_limit > effective_min:
                 state.concurrency_limit -= 1
                 state.last_concurrency_change = now
                 app_logger.info(
@@ -401,7 +418,7 @@ async def auto_concurrency_manager(state: ScraperState):
             elif (
                 cpu < CPU_LOWER_THRESHOLD
                 and mem < MEM_UPPER_THRESHOLD
-                and state.concurrency_limit < AUTO_MAX_CONCURRENCY
+                and state.concurrency_limit < effective_max
             ):
                 state.concurrency_limit += 1
                 state.last_concurrency_change = now
@@ -409,10 +426,10 @@ async def auto_concurrency_manager(state: ScraperState):
                     f"Auto-concurrency: increased to {state.concurrency_limit} (CPU {cpu:.1f}%, MEM {mem:.1f}%)"
                 )
 
-            if state.concurrency_limit > AUTO_MAX_CONCURRENCY:
-                state.concurrency_limit = AUTO_MAX_CONCURRENCY
-            if state.concurrency_limit < AUTO_MIN_CONCURRENCY:
-                state.concurrency_limit = AUTO_MIN_CONCURRENCY
+            if state.concurrency_limit > effective_max:
+                state.concurrency_limit = effective_max
+            if state.concurrency_limit < effective_min:
+                state.concurrency_limit = effective_min
 
             async with state.concurrency_condition:
                 state.concurrency_condition.notify_all()

@@ -129,7 +129,9 @@ class ScraperState:
         self.last_concurrency_change = 0.0
         self.fast_path_semaphore = asyncio.Semaphore(FAST_PATH_MAX_CONCURRENCY)
         self.fast_path_lock = asyncio.Lock()
+        self.fast_path_backoff_lock = asyncio.Lock()
         self.fast_path_started_count = 0
+        self.fast_path_backoff_until = 0.0
 
         self.cache = CacheManager()
 

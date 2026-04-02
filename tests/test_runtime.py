@@ -266,9 +266,28 @@ def test_route_store_work_items_disables_fast_path_routing_when_template_missing
     assert state.ui_routed_at_start == 2
 
 
+def test_should_bypass_auto_concurrency_for_all_fast_path_warm_cache_run():
+    state = ScraperState()
+    state.fast_path_eligible_at_start = 85
+    state.ui_routed_at_start = 0
+
+    assert scraper.should_bypass_auto_concurrency(state) is True
+
+
+def test_should_not_bypass_auto_concurrency_when_ui_work_exists():
+    state = ScraperState()
+    state.fast_path_eligible_at_start = 60
+    state.ui_routed_at_start = 5
+
+    assert scraper.should_bypass_auto_concurrency(state) is False
+
+
 @pytest.mark.asyncio
 async def test_fetch_metrics_fast_path_retries_transient_503_then_succeeds(monkeypatch):
-    async def no_sleep(_seconds):
+    sleep_calls: list[float] = []
+
+    async def no_sleep(seconds):
+        sleep_calls.append(seconds)
         return None
 
     monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
@@ -285,6 +304,58 @@ async def test_fetch_metrics_fast_path_retries_transient_503_then_succeeds(monke
     )
 
     assert payload["metrics"]["OrdersShopped_V2"] == 8
+    assert sleep_calls == [pytest.approx(1.5, abs=0.01)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_metrics_fast_path_expands_warmup_to_worker_pool_size(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def no_sleep(seconds):
+        sleep_calls.append(seconds)
+        return None
+
+    monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
+
+    request_client = FakeRequestClient([200])
+    state = ScraperState()
+    state.browser_worker_pool_size = 12
+    state.fast_path_started_count = 11
+
+    await metrics_service.fetch_metrics_fast_path(
+        request_client,
+        "https://example.com/metrics?merchantIds%5B%5D=MID123",
+        "Belle Vale Morrisons",
+        state,
+        45_000,
+    )
+
+    assert sleep_calls == [pytest.approx(1.65, abs=0.01)]
+
+
+@pytest.mark.asyncio
+async def test_fetch_metrics_fast_path_honors_shared_backpressure_before_request(monkeypatch):
+    sleep_calls: list[float] = []
+
+    async def no_sleep(seconds):
+        sleep_calls.append(seconds)
+        return None
+
+    monkeypatch.setattr(metrics_service.asyncio, "sleep", no_sleep)
+
+    request_client = FakeRequestClient([200])
+    state = ScraperState()
+    state.fast_path_backoff_until = asyncio.get_running_loop().time() + 2.0
+
+    await metrics_service.fetch_metrics_fast_path(
+        request_client,
+        "https://example.com/metrics?merchantIds%5B%5D=MID123",
+        "Belle Vale Morrisons",
+        state,
+        45_000,
+    )
+
+    assert sleep_calls == [pytest.approx(2.0, abs=0.01)]
 
 
 @pytest.mark.asyncio

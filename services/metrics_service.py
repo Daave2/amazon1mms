@@ -9,6 +9,7 @@ from playwright.async_api import Page, TimeoutError, expect
 
 from core.config import (
     BASE_DASHBOARD_URL,
+    FAST_PATH_MAX_CONCURRENCY,
     FAST_PATH_RETRY_BASE_DELAY_MS,
     FAST_PATH_RETRY_COUNT,
     FAST_PATH_WARMUP_DELAY_MS,
@@ -268,13 +269,38 @@ def build_store_submission(store_name: str, api_data: list[dict] | dict) -> tupl
     return form_data, normalized_metrics
 
 
+def _fast_path_warmup_window(state: ScraperState) -> int:
+    worker_pool_size = state.browser_worker_pool_size or FAST_PATH_MAX_CONCURRENCY
+    return max(FAST_PATH_WARMUP_REQUESTS, min(worker_pool_size, FAST_PATH_MAX_CONCURRENCY))
+
+
+async def _wait_for_fast_path_backpressure(state: ScraperState, store_name: str):
+    async with state.fast_path_backoff_lock:
+        wait_seconds = max(state.fast_path_backoff_until - asyncio.get_running_loop().time(), 0.0)
+
+    if wait_seconds > 0:
+        app_logger.info(
+            f"[{store_name}] Fast Path transient cooldown {wait_seconds:.2f}s before next API request."
+        )
+        await asyncio.sleep(wait_seconds)
+
+
+async def _apply_fast_path_backpressure(state: ScraperState, delay_seconds: float):
+    async with state.fast_path_backoff_lock:
+        state.fast_path_backoff_until = max(
+            state.fast_path_backoff_until,
+            asyncio.get_running_loop().time() + delay_seconds,
+        )
+
+
 async def fetch_metrics_fast_path(request_client, target_url: str, store_name: str, state: ScraperState, timeout: int):
     async with state.fast_path_semaphore:
         async with state.fast_path_lock:
             request_index = state.fast_path_started_count
             state.fast_path_started_count += 1
 
-        if request_index < FAST_PATH_WARMUP_REQUESTS:
+        warmup_window = _fast_path_warmup_window(state)
+        if request_index < warmup_window:
             warmup_delay = (request_index * FAST_PATH_WARMUP_DELAY_MS) / 1000
             if warmup_delay > 0:
                 app_logger.info(
@@ -283,6 +309,7 @@ async def fetch_metrics_fast_path(request_client, target_url: str, store_name: s
                 await asyncio.sleep(warmup_delay)
 
         for api_attempt in range(FAST_PATH_RETRY_COUNT):
+            await _wait_for_fast_path_backpressure(state, store_name)
             resp = await request_client.get(target_url, timeout=timeout)
             if resp.status == 200:
                 return await resp.json()
@@ -290,9 +317,9 @@ async def fetch_metrics_fast_path(request_client, target_url: str, store_name: s
             if resp.status in TRANSIENT_FAST_PATH_STATUSES and api_attempt < FAST_PATH_RETRY_COUNT - 1:
                 delay_seconds = (FAST_PATH_RETRY_BASE_DELAY_MS / 1000) * (2**api_attempt)
                 app_logger.warning(
-                    f"[{store_name}] API returned {resp.status}. Retrying in {delay_seconds:.1f}s..."
+                    f"[{store_name}] API returned {resp.status}. Applying shared fast-path cooldown of {delay_seconds:.1f}s before retry."
                 )
-                await asyncio.sleep(delay_seconds)
+                await _apply_fast_path_backpressure(state, delay_seconds)
                 continue
 
             raise Exception(f"API Fetch failed: {resp.status}")
