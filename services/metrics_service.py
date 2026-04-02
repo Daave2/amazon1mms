@@ -28,6 +28,16 @@ from core.utils import normalize_name, save_screenshot
 TRANSIENT_FAST_PATH_STATUSES = {503, 504}
 
 
+def resolve_dropdown_name(store_name: str) -> str:
+    dropdown_name = normalize_name(store_name)
+
+    for key, val in SPECIAL_NAME_MAPPINGS.items():
+        if key in dropdown_name:
+            return val
+
+    return dropdown_name
+
+
 def _build_search_terms(dropdown_name: str, store_name: str) -> list[str]:
     raw_terms = [
         dropdown_name,
@@ -67,6 +77,32 @@ def _selection_matches_target(selected_text: str, dropdown_name: str, store_name
     return False
 
 
+def _parse_available_store_options(option_rows: list[tuple[str | None, str | None]]) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for option_id, option_text in option_rows:
+        cleaned_text = re.sub(r"\s+", " ", option_text or "").strip()
+        normalized_name = normalize_name(cleaned_text)
+        if not normalized_name or normalized_name in seen:
+            continue
+
+        seen.add(normalized_name)
+        merchant_id = ""
+        if option_id and option_id.startswith("store-selector-option-"):
+            merchant_id = option_id.replace("store-selector-option-", "", 1)
+
+        options.append(
+            {
+                "store_name": cleaned_text,
+                "normalized_name": normalized_name,
+                "merchant_id": merchant_id,
+            }
+        )
+
+    return options
+
+
 async def _visible_dropdown_overlay(page: Page):
     selectors = [
         "kat-popover:visible",
@@ -86,6 +122,28 @@ async def _visible_dropdown_overlay(page: Page):
     return None
 
 
+async def _open_store_dropdown(page: Page, store_name: str):
+    dropdown_trigger = page.locator("#store-selector-dropdown")
+    try:
+        await expect(dropdown_trigger).to_be_visible(timeout=30000)
+        for _ in range(3):
+            await dropdown_trigger.first.click(force=True)
+            await asyncio.sleep(1)
+            overlay = await _visible_dropdown_overlay(page)
+            if overlay is not None:
+                return dropdown_trigger, overlay
+    except Exception as exc:
+        app_logger.warning(f"[{store_name}] Failed to click dropdown trigger: {exc}")
+        await page.get_by_text("Select a store").first.click(force=True)
+
+    await asyncio.sleep(2)
+    overlay = await _visible_dropdown_overlay(page)
+    if overlay is None:
+        raise TimeoutError("Store selector dropdown did not open")
+
+    return dropdown_trigger, overlay
+
+
 async def _current_store_selector_text(page: Page) -> str:
     selectors = [
         "#store-selector-dropdown",
@@ -102,6 +160,23 @@ async def _current_store_selector_text(page: Page) -> str:
         except Exception:
             continue
     return ""
+
+
+async def discover_available_dropdown_stores(page: Page) -> list[dict[str, str]]:
+    _dropdown_trigger, overlay = await _open_store_dropdown(page, "Store Discovery")
+    option_locator = overlay.locator("li[id^='store-selector-option-'], li.dropdown-option, li.dropdown-option-selected")
+
+    option_rows: list[tuple[str | None, str | None]] = []
+    for index in range(await option_locator.count()):
+        option = option_locator.nth(index)
+        option_rows.append((await option.get_attribute("id"), await option.text_content()))
+
+    stores = _parse_available_store_options(option_rows)
+    if not stores:
+        raise TimeoutError("Store selector dropdown contained no store options")
+
+    app_logger.info(f"[Store Discovery] Found {len(stores)} live store(s) in the selector dropdown.")
+    return stores
 
 
 async def _select_option_via_overlay_text(page: Page, search_term: str, store_name: str):
@@ -210,19 +285,7 @@ async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str,
 async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name: str):
     app_logger.info(f"[{store_name}] Selecting store from dropdown matching: {dropdown_name}")
 
-    dropdown_trigger = page.locator("#store-selector-dropdown")
-    try:
-        await expect(dropdown_trigger).to_be_visible(timeout=30000)
-        for _ in range(3):
-            await dropdown_trigger.first.click(force=True)
-            await asyncio.sleep(1)
-            if await page.locator("kat-popover input, kat-dropdown-menu input, .dropdown-list").first.is_visible():
-                break
-    except Exception as e:
-        app_logger.warning(f"[{store_name}] Failed to click dropdown trigger: {e}")
-        await page.get_by_text("Select a store").first.click(force=True)
-
-    await asyncio.sleep(2)
+    dropdown_trigger, _overlay = await _open_store_dropdown(page, store_name)
 
     search_input = page.locator(
         'kat-popover input:visible, kat-dropdown-menu input:visible, .dropdown-search input, #store-selector-input input, .store-selector-input input, input[id^="katal-id-"]:visible:not(#katal-id-0, [placeholder*="shoppers" i]), kat-input[placeholder*="Search"]:not([placeholder*="shoppers" i]) input'
@@ -279,13 +342,7 @@ async def process_single_store(
 ):
     start_ts = asyncio.get_running_loop().time()
     store_name = store_info["store_name"]
-    formatted_name = normalize_name(store_name)
-    dropdown_name = formatted_name
-
-    for key, val in SPECIAL_NAME_MAPPINGS.items():
-        if key in dropdown_name:
-            dropdown_name = val
-            break
+    dropdown_name = resolve_dropdown_name(store_name)
 
     merchant_id = store_info.get("merchant_id") or state.cache.merchant_id_cache.get(store_name)
     METRICS_TIMEOUT = 45_000

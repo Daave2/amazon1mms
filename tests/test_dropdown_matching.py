@@ -1,4 +1,9 @@
-from services.metrics_service import _build_search_terms, _selection_matches_target
+from services.metrics_service import (
+    _build_search_terms,
+    _parse_available_store_options,
+    _selection_matches_target,
+    resolve_dropdown_name,
+)
 
 
 def test_build_search_terms_includes_normalized_and_original_variants():
@@ -13,3 +18,32 @@ def test_selection_matches_target_tolerates_formatting_variants():
     assert _selection_matches_target("Morrisons Weston Super Mare", "weston-super-mare", "Morrisons Weston Super Mare")
     assert _selection_matches_target("Wellington Gardens", "wellington gardens", "Wellington Gardens")
     assert not _selection_matches_target("Morrisons Aberdeen", "basingstoke", "Morrisons Basingstoke")
+
+
+def test_resolve_dropdown_name_applies_special_store_mappings():
+    assert resolve_dropdown_name("Morrisons Cardiff Tygals") == "cardiff tyglass"
+    assert resolve_dropdown_name("Morrisons Weston Super Mare") == "weston-super-mare"
+
+
+def test_parse_available_store_options_extracts_merchant_ids_and_deduplicates():
+    parsed = _parse_available_store_options(
+        [
+            ("store-selector-option-A1KDGRVT6JAV6B", "Belle Vale"),
+            ("store-selector-option-A1KDGRVT6JAV6B", "Belle Vale"),
+            ("store-selector-option-A3W2L835GZRAX2", "Cardiff Tyglass"),
+            (None, ""),
+        ]
+    )
+
+    assert parsed == [
+        {
+            "store_name": "Belle Vale",
+            "normalized_name": "belle vale",
+            "merchant_id": "A1KDGRVT6JAV6B",
+        },
+        {
+            "store_name": "Cardiff Tyglass",
+            "normalized_name": "cardiff tyglass",
+            "merchant_id": "A3W2L835GZRAX2",
+        },
+    ]

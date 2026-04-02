@@ -32,7 +32,7 @@ from core.utils import safe_close
 from services.auth_service import check_if_login_needed, prime_master_session
 from services.chat_service import flush_pending_chat_entries, post_job_summary
 from services.forms_service import http_form_submitter_worker
-from services.metrics_service import process_single_store
+from services.metrics_service import discover_available_dropdown_stores, process_single_store, resolve_dropdown_name
 
 
 def load_default_data(state: ScraperState) -> list:
@@ -74,6 +74,84 @@ def ensure_storage_state():
         return True
     except json.JSONDecodeError:
         return False
+
+
+def filter_stores_to_live_dropdown(
+    urls_data: list[dict[str, str]],
+    available_stores: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    available_by_name: dict[str, dict[str, str]] = {}
+    for available_store in available_stores:
+        normalized_name = available_store.get("normalized_name", "").strip()
+        if normalized_name and normalized_name not in available_by_name:
+            available_by_name[normalized_name] = available_store
+
+    filtered_stores: list[dict[str, str]] = []
+    skipped_stores: list[dict[str, str]] = []
+
+    for store in urls_data:
+        normalized_name = resolve_dropdown_name(store["store_name"])
+        matched_store = available_by_name.get(normalized_name)
+        if not matched_store:
+            skipped_stores.append(store)
+            continue
+
+        filtered_store = dict(store)
+        merchant_id = matched_store.get("merchant_id", "").strip()
+        if merchant_id and not filtered_store.get("merchant_id"):
+            filtered_store["merchant_id"] = merchant_id
+        filtered_stores.append(filtered_store)
+
+    return filtered_stores, skipped_stores
+
+
+async def load_live_dropdown_stores(
+    browser: Browser,
+    storage_template: dict,
+    urls_data: list[dict[str, str]],
+    state: ScraperState,
+) -> list[dict[str, str]]:
+    context = None
+    page = None
+    try:
+        app_logger.info("Discovering live store list from the dashboard dropdown before queueing stores.")
+        context = await browser.new_context(storage_state=storage_template)
+        context.set_default_navigation_timeout(PAGE_TIMEOUT)
+        context.set_default_timeout(ACTION_TIMEOUT)
+        page = await context.new_page()
+        await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="networkidle")
+
+        available_stores = await discover_available_dropdown_stores(page)
+        filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
+
+        cache_updated = False
+        for store in filtered_stores:
+            merchant_id = store.get("merchant_id", "").strip()
+            if merchant_id and state.cache.merchant_id_cache.get(store["store_name"]) != merchant_id:
+                state.cache.merchant_id_cache[store["store_name"]] = merchant_id
+                cache_updated = True
+
+        if cache_updated:
+            await state.cache.save()
+
+        app_logger.info(
+            f"Live dropdown filtering kept {len(filtered_stores)} of {len(urls_data)} configured store(s)."
+        )
+        if skipped_stores:
+            skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
+            suffix = "..." if len(skipped_stores) > 10 else ""
+            app_logger.warning(
+                f"Skipping {len(skipped_stores)} configured store(s) not currently listed in the live dropdown: "
+                f"{skipped_names}{suffix}"
+            )
+
+        return filtered_stores
+    except Exception:
+        app_logger.exception("Failed to discover and filter stores from the live dashboard dropdown.")
+        raise
+    finally:
+        await safe_close(page, "Live dropdown discovery page", state.record_issue)
+        await safe_close(context, "Live dropdown discovery context", state.record_issue)
 
 
 async def auto_concurrency_manager(state: ScraperState):
@@ -251,6 +329,12 @@ async def process_urls(browser: Browser, state: ScraperState):
 
     with open(STORAGE_STATE) as f:
         storage_template = json.load(f)
+
+    urls_data = await load_live_dropdown_stores(browser, storage_template, urls_data, state)
+    if not urls_data:
+        app_logger.error("No configured stores are currently listed in the live dropdown. Aborting job.")
+        state.set_job_status("aborted_no_stores", "No configured stores were present in the live dropdown")
+        return
 
     job_queue = asyncio.Queue()
     submission_queue = asyncio.Queue()

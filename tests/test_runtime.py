@@ -148,6 +148,43 @@ class FakeBrowser:
         return context
 
 
+def test_filter_stores_to_live_dropdown_only_keeps_currently_listed_stores():
+    urls_data = [
+        {"store_name": "Belle Vale Morrisons", "merchant_id": "", "marketplace_id": "", "dropdown_name": "Belle Vale"},
+        {
+            "store_name": "Morrisons Cardiff Tygals",
+            "merchant_id": "",
+            "marketplace_id": "",
+            "dropdown_name": "Cardiff Tygals",
+        },
+        {"store_name": "Morrisons Missing Store", "merchant_id": "", "marketplace_id": "", "dropdown_name": "Missing"},
+    ]
+    available_stores = [
+        {
+            "store_name": "Belle Vale",
+            "normalized_name": "belle vale",
+            "merchant_id": "A1KDGRVT6JAV6B",
+        },
+        {
+            "store_name": "Cardiff Tyglass",
+            "normalized_name": "cardiff tyglass",
+            "merchant_id": "A3W2L835GZRAX2",
+        },
+    ]
+
+    filtered, skipped = scraper.filter_stores_to_live_dropdown(urls_data, available_stores)
+
+    assert [store["store_name"] for store in filtered] == [
+        "Belle Vale Morrisons",
+        "Morrisons Cardiff Tygals",
+    ]
+    assert [store["merchant_id"] for store in filtered] == [
+        "A1KDGRVT6JAV6B",
+        "A3W2L835GZRAX2",
+    ]
+    assert [store["store_name"] for store in skipped] == ["Morrisons Missing Store"]
+
+
 @pytest.mark.asyncio
 async def test_fast_path_retries_transient_503_then_succeeds(monkeypatch):
     async def no_sleep(_seconds):
