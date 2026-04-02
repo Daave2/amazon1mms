@@ -210,51 +210,74 @@ async def load_live_dropdown_stores(
     urls_data: list[dict[str, str]],
     state: ScraperState,
 ) -> list[dict[str, str]]:
-    context = None
-    page = None
-    try:
-        app_logger.info("Discovering live store list from the dashboard dropdown before queueing stores.")
-        context = await browser.new_context(storage_state=storage_template)
-        await optimize_browser_context(context)
-        context.set_default_navigation_timeout(PAGE_TIMEOUT)
-        context.set_default_timeout(ACTION_TIMEOUT)
-        page = await context.new_page()
-        await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+    app_logger.info("Discovering live store list from the dashboard dropdown before queueing stores.")
 
-        available_stores = await discover_available_dropdown_stores(page)
-        filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
+    discovery_attempts = [
+        ("fast-load", True, "load"),
+        ("settled-load", True, "networkidle"),
+        ("safe-load", False, "networkidle"),
+    ]
+    available_stores = None
+    last_exc = None
 
-        cache_updated = False
-        for store in filtered_stores:
-            merchant_id = store.get("merchant_id", "").strip()
-            if merchant_id and state.cache.merchant_id_cache.get(store["store_name"]) != merchant_id:
-                state.cache.merchant_id_cache[store["store_name"]] = merchant_id
-                cache_updated = True
-
-        if cache_updated:
-            await state.cache.save()
-
-        matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
-        live_only_count = len(filtered_stores) - matched_configured_count
-        app_logger.info(
-            f"Live dropdown queue contains {len(filtered_stores)} store(s): "
-            f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
-        )
-        if skipped_stores:
-            skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
-            suffix = "..." if len(skipped_stores) > 10 else ""
-            app_logger.warning(
-                f"Ignoring {len(skipped_stores)} configured store(s) not currently listed in the live dropdown: "
-                f"{skipped_names}{suffix}"
+    for attempt_name, optimize_context, wait_until in discovery_attempts:
+        context = None
+        page = None
+        try:
+            app_logger.info(
+                f"Live dropdown discovery attempt '{attempt_name}' with wait_until='{wait_until}'."
             )
+            context = await browser.new_context(storage_state=storage_template)
+            if optimize_context:
+                await optimize_browser_context(context)
+            context.set_default_navigation_timeout(PAGE_TIMEOUT)
+            context.set_default_timeout(ACTION_TIMEOUT)
+            page = await context.new_page()
+            await page.goto(BASE_DASHBOARD_URL, timeout=PAGE_TIMEOUT, wait_until=wait_until)
+            available_stores = await discover_available_dropdown_stores(page)
+            break
+        except Exception as exc:
+            last_exc = exc
+            app_logger.warning(
+                f"Live dropdown discovery attempt '{attempt_name}' failed: {exc}"
+            )
+        finally:
+            await safe_close(page, f"Live dropdown discovery page ({attempt_name})", state.record_issue)
+            await safe_close(context, f"Live dropdown discovery context ({attempt_name})", state.record_issue)
 
-        return filtered_stores
-    except Exception:
-        app_logger.exception("Failed to discover and filter stores from the live dashboard dropdown.")
-        raise
-    finally:
-        await safe_close(page, "Live dropdown discovery page", state.record_issue)
-        await safe_close(context, "Live dropdown discovery context", state.record_issue)
+    if available_stores is None:
+        app_logger.error("Failed to discover and filter stores from the live dashboard dropdown.")
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Live dropdown discovery failed without a captured exception")
+
+    filtered_stores, skipped_stores = filter_stores_to_live_dropdown(urls_data, available_stores)
+
+    cache_updated = False
+    for store in filtered_stores:
+        merchant_id = store.get("merchant_id", "").strip()
+        if merchant_id and state.cache.merchant_id_cache.get(store["store_name"]) != merchant_id:
+            state.cache.merchant_id_cache[store["store_name"]] = merchant_id
+            cache_updated = True
+
+    if cache_updated:
+        await state.cache.save()
+
+    matched_configured_count = sum(bool(store.get("matched_from_configured")) for store in filtered_stores)
+    live_only_count = len(filtered_stores) - matched_configured_count
+    app_logger.info(
+        f"Live dropdown queue contains {len(filtered_stores)} store(s): "
+        f"{matched_configured_count} matched configured row(s), {live_only_count} live-only row(s)."
+    )
+    if skipped_stores:
+        skipped_names = ", ".join(store["store_name"] for store in skipped_stores[:10])
+        suffix = "..." if len(skipped_stores) > 10 else ""
+        app_logger.warning(
+            f"Ignoring {len(skipped_stores)} configured store(s) not currently listed in the live dropdown: "
+            f"{skipped_names}{suffix}"
+        )
+
+    return filtered_stores
 
 
 async def auto_concurrency_manager(state: ScraperState):

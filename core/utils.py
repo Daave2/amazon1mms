@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from core.config import EMOJI_GREEN_CHECK, EMOJI_RED_CROSS, RESOURCE_BLOCKLIST, STORE_PREFIX_RE
 from core.logger import app_logger
 
-BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
+BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
 def normalize_name(name: str) -> str:
