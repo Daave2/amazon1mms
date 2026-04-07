@@ -29,9 +29,12 @@ if str(REPO_ROOT) not in sys.path:
 from core.config import load_settings  # noqa: E402
 from core.logger import app_logger, configure_logging  # noqa: E402
 from core.metrics import build_form_data, normalize_metrics_payload  # noqa: E402
+from core.reporting import write_runtime_reports  # noqa: E402
 from core.state import CacheManager, ScraperState  # noqa: E402
 from core.store_loader import load_stores_from_csv  # noqa: E402
 from core.utils import ensure_directory, optimize_browser_context, safe_close  # noqa: E402
+from services.chat_service import chat_dispatcher_worker, post_job_summary  # noqa: E402
+from services.forms_service import SubmissionManager, SubmissionTask, build_submission_id  # noqa: E402
 from services.metrics_service import (  # noqa: E402
     _build_fast_path_target_url,
     fetch_metrics_pair_fast_path,
@@ -138,6 +141,21 @@ def _store_slug(store_name: str) -> str:
     return store_name.lower().replace(" ", "_").replace("/", "_")
 
 
+class ExtractSubmissionManager(SubmissionManager):
+    async def record_extracted_submission(self, form_data: dict[str, str]) -> SubmissionTask:
+        task = SubmissionTask(
+            submission_id=build_submission_id(self.state.run_id, form_data.get("store", "Unknown")),
+            run_id=self.state.run_id,
+            form_data=dict(form_data),
+        )
+        await self.ledger.append_event(self._build_event(task, status="sent", http_status=204))
+        self.state.submissions.queued += 1
+        self.state.submissions.sent += 1
+        await self.log_submission(task)
+        await self.state.increment_progress()
+        return task
+
+
 async def run_extraction(args: argparse.Namespace):
     settings = load_settings()
     ensure_directory(settings.output_dir)
@@ -179,9 +197,15 @@ async def run_extraction(args: argparse.Namespace):
     app_logger.info("Artifacts will be written to %s", run_dir)
 
     state = ScraperState(settings=settings)
+    await state.init_progress(len(selected_stores))
+    state.browser_worker_pool_size = settings.fast_path_max_concurrency
+    state.form_submitter_count = 0
     browser = None
     context = None
     page = None
+    chat_queue: asyncio.Queue = asyncio.Queue()
+    submission_manager = ExtractSubmissionManager(settings, state, chat_queue)
+    chat_dispatcher_task = asyncio.create_task(chat_dispatcher_worker(chat_queue, state, settings))
     results: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     started_at = time.monotonic()
@@ -195,15 +219,17 @@ async def run_extraction(args: argparse.Namespace):
             await page.goto(settings.base_dashboard_url, timeout=settings.page_timeout_ms, wait_until="domcontentloaded")
             login_visible = await page.locator("input#ap_email, input#ap_password, input[name='email']").first.is_visible()
             if login_visible:
+                state.auth_state_status = "refresh_required"
                 raise RuntimeError("Saved auth state is not valid for manual extraction.")
+            state.auth_state_status = "reused"
             app_logger.info("Saved auth state is valid for manual extraction.")
 
             request_client = context.request
-            state.browser_worker_pool_size = settings.fast_path_max_concurrency
 
             async def extract_single_store(index: int, store: dict[str, str]):
                 store_name = store["store_name"]
                 merchant_id = store["merchant_id"]
+                store_started_at = time.monotonic()
                 app_logger.info("[%s/%s] Starting extraction for %s", index, len(selected_stores), store_name)
                 try:
                     summary_url = _build_fast_path_target_url(
@@ -247,6 +273,14 @@ async def run_extraction(args: argparse.Namespace):
                         current_dt=end_dt,
                         local_timezone=settings.local_timezone,
                     )
+                    await submission_manager.record_extracted_submission(display_metrics)
+                    await state.record_metric(
+                        store_name,
+                        time.monotonic() - store_started_at,
+                        int(combined.get("OrdersShopped_V2", 0)),
+                        int(combined.get("RequestedQuantity_V2", 0)),
+                        path="fast_path",
+                    )
 
                     results.append(
                         {
@@ -279,11 +313,19 @@ async def run_extraction(args: argparse.Namespace):
                     )
                 except Exception as exc:
                     failures.append({"store": store_name, "error": str(exc)})
+                    await state.add_failure(
+                        f"{store_name} (Manual Extract Failure)",
+                        asyncio.get_running_loop().time(),
+                        category="api_fast_path",
+                    )
                     app_logger.exception("[%s/%s] Extraction failed for %s: %s", index, len(selected_stores), store_name, exc)
             await asyncio.gather(
                 *(extract_single_store(index, store) for index, store in enumerate(selected_stores, start=1))
             )
     finally:
+        await chat_queue.put(None)
+        await chat_queue.join()
+        await chat_dispatcher_task
         await safe_close(page, "Manual extraction page")
         await safe_close(context, "Manual extraction context")
         await safe_close(browser, "Manual extraction browser")
@@ -337,6 +379,14 @@ async def run_extraction(args: argparse.Namespace):
             )
 
     elapsed_seconds = time.monotonic() - started_at
+    state.finish_run()
+    if state.job_status == "running":
+        if state.run_failures:
+            state.set_job_status("completed_with_failures", f"{len(state.run_failures)} terminal failure(s)")
+        else:
+            state.set_job_status("completed", "Run completed successfully")
+    await post_job_summary(state, settings, elapsed_seconds)
+    write_runtime_reports(state, settings)
     app_logger.info(
         "Manual extract complete in %.2fs. Success=%s Failure=%s Output=%s",
         elapsed_seconds,
@@ -344,18 +394,6 @@ async def run_extraction(args: argparse.Namespace):
         len(failures),
         run_dir,
     )
-
-    summary_lines = [
-        "## Manual Extract Summary",
-        "",
-        f"- Window: `{start_dt.isoformat()} -> {end_dt.isoformat()}`",
-        f"- Success: `{len(results)}`",
-        f"- Failure: `{len(failures)}`",
-        f"- Output: `{run_dir}`",
-    ]
-    github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if github_step_summary:
-        Path(github_step_summary).write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
     print(f"Output: {run_dir}")
     print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()}")
