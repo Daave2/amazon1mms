@@ -34,6 +34,7 @@ DEFAULT_MAX_WAIT_SECONDS = 15.0
 DEFAULT_QUIET_SECONDS = 2.5
 DEFAULT_POLL_INTERVAL_MS = 100
 DEFAULT_ATTRIBUTION_GAP_MS = 2500
+DEFAULT_DASHBOARD_READY_TIMEOUT_MS = 45000
 
 LATE_PROBE_SCRIPT = r"""
 (() => {
@@ -587,6 +588,90 @@ async def _write_debug_artifacts(page, run_dir: Path, prefix: str):
         pass
 
 
+async def _dashboard_state_snapshot(page) -> dict[str, Any]:
+    return await page.evaluate(
+        """() => {
+            const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+            const login = document.querySelector("input#ap_email, input#ap_password, input[name='email']");
+            const shell = document.querySelector("#content > div > div.mainAppContainerExternal, .mainAppContainerExternal");
+            const dropdown = document.querySelector("#store-selector-dropdown");
+            const refreshButton = Array.from(document.querySelectorAll("button, kat-button"))
+              .find((element) => /refresh/i.test(normalizeText(element.textContent || element.getAttribute("label") || "")));
+
+            const dropdownDisabled =
+              !dropdown ||
+              dropdown.classList.contains("dropdown-button-disabled") ||
+              dropdown.getAttribute("aria-disabled") === "true" ||
+              dropdown.getAttribute("disabled") !== null;
+
+            const refreshDisabled =
+              !refreshButton ||
+              refreshButton.hasAttribute("disabled") ||
+              refreshButton.getAttribute("aria-disabled") === "true";
+
+            const spinnerCount = document.querySelectorAll("kat-spinner").length;
+
+            return {
+              loginVisible: Boolean(login),
+              dashboardShellVisible: Boolean(shell),
+              dropdownPresent: Boolean(dropdown),
+              dropdownDisabled,
+              refreshPresent: Boolean(refreshButton),
+              refreshDisabled,
+              spinnerCount,
+              dropdownText: normalizeText(dropdown ? dropdown.textContent : ""),
+              refreshText: normalizeText(
+                refreshButton ? (refreshButton.textContent || refreshButton.getAttribute("label") || "") : ""
+              ),
+            };
+        }"""
+    )
+
+
+def _is_dashboard_ready(state: dict[str, Any] | None) -> bool:
+    if not state:
+        return False
+    return bool(
+        state.get("dashboardShellVisible")
+        and state.get("dropdownPresent")
+        and not state.get("dropdownDisabled")
+        and state.get("refreshPresent")
+        and not state.get("refreshDisabled")
+    )
+
+
+def _dashboard_state_reason(state: dict[str, Any] | None) -> str:
+    if not state:
+        return "unknown"
+    if state.get("loginVisible"):
+        return "login_required"
+    if _is_dashboard_ready(state):
+        return "ready"
+    if state.get("dashboardShellVisible"):
+        if not state.get("dropdownPresent"):
+            return "dashboard_loaded_dropdown_missing"
+        if state.get("dropdownDisabled"):
+            return "dashboard_loaded_dropdown_disabled"
+        if not state.get("refreshPresent"):
+            return "dashboard_loaded_refresh_missing"
+        if state.get("refreshDisabled"):
+            return "dashboard_loaded_refresh_disabled"
+        return "dashboard_loaded_waiting"
+    return "dashboard_not_loaded"
+
+
+async def _wait_for_dashboard_ready(page, timeout_ms: int) -> dict[str, Any]:
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    last_state: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        last_state = await _dashboard_state_snapshot(page)
+        reason = _dashboard_state_reason(last_state)
+        if reason == "login_required" or reason == "ready":
+            return last_state
+        await asyncio.sleep(1)
+    return last_state or {}
+
+
 async def run_probe(args: argparse.Namespace):
     settings = load_settings()
     storage_state_path = Path(settings.storage_state_path)
@@ -616,11 +701,25 @@ async def run_probe(args: argparse.Namespace):
             page = await context.new_page()
 
             await page.goto(settings.base_dashboard_url, timeout=settings.page_timeout_ms, wait_until="domcontentloaded")
-            if await check_if_login_needed(page, settings.base_dashboard_url, settings):
+            dashboard_state = await _wait_for_dashboard_ready(
+                page,
+                max(settings.page_timeout_ms, DEFAULT_DASHBOARD_READY_TIMEOUT_MS),
+            )
+            state_reason = _dashboard_state_reason(dashboard_state)
+
+            if state_reason == "login_required" or (
+                await check_if_login_needed(page, settings.base_dashboard_url, settings) and not dashboard_state.get("dashboardShellVisible")
+            ):
                 await _write_debug_artifacts(page, run_dir, "login_required")
                 raise RuntimeError(
                     "The saved session is no longer valid. Re-run the normal scraper login flow so state.json is refreshed, "
                     "then retry the probe. Debug artifacts were saved in the probe output folder."
+                )
+            if not _is_dashboard_ready(dashboard_state):
+                await _write_debug_artifacts(page, run_dir, "dashboard_not_ready")
+                raise RuntimeError(
+                    f"SnowDash loaded but never became interactive for '{args.store}'. "
+                    f"State: {state_reason}. Saved screenshot and HTML to {run_dir} for inspection."
                 )
 
             try:

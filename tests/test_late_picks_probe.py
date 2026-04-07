@@ -5,7 +5,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.debug.late_picks_probe import _attribute_render_events, _summarize_payload
+from scripts.debug.late_picks_probe import (
+    _attribute_render_events,
+    _dashboard_state_reason,
+    _is_dashboard_ready,
+    _summarize_payload,
+)
 
 
 def test_attribute_render_events_matches_latest_preceding_response():
@@ -43,3 +48,31 @@ def test_summarize_payload_surfaces_late_related_entries():
     assert summary["merchant_ids"] == ["MID123"]
     assert summary["type_counts"] == {"MASTER": 1}
     assert any(entry["path"].endswith("LatePicksRate") for entry in summary["late_related"])
+
+
+def test_dashboard_state_reason_detects_loading_shell():
+    state = {
+        "loginVisible": False,
+        "dashboardShellVisible": True,
+        "dropdownPresent": True,
+        "dropdownDisabled": True,
+        "refreshPresent": True,
+        "refreshDisabled": True,
+    }
+
+    assert _is_dashboard_ready(state) is False
+    assert _dashboard_state_reason(state) == "dashboard_loaded_dropdown_disabled"
+
+
+def test_dashboard_state_reason_detects_ready_dashboard():
+    state = {
+        "loginVisible": False,
+        "dashboardShellVisible": True,
+        "dropdownPresent": True,
+        "dropdownDisabled": False,
+        "refreshPresent": True,
+        "refreshDisabled": False,
+    }
+
+    assert _is_dashboard_ready(state) is True
+    assert _dashboard_state_reason(state) == "ready"
