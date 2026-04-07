@@ -31,7 +31,6 @@ from core.metrics import build_form_data, normalize_metrics_payload  # noqa: E40
 from core.state import CacheManager, ScraperState  # noqa: E402
 from core.store_loader import load_stores_from_csv  # noqa: E402
 from core.utils import ensure_directory, optimize_browser_context, safe_close  # noqa: E402
-from services.auth_service import check_if_login_needed  # noqa: E402
 from services.metrics_service import (  # noqa: E402
     _build_fast_path_target_url,
     fetch_metrics_pair_fast_path,
@@ -170,8 +169,9 @@ async def run_extraction(args: argparse.Namespace):
             context = await browser.new_context(storage_state=str(storage_state_path))
             await optimize_browser_context(context, settings)
             page = await context.new_page()
-
-            if await check_if_login_needed(page, settings.base_dashboard_url, settings):
+            await page.goto(settings.base_dashboard_url, timeout=settings.page_timeout_ms, wait_until="domcontentloaded")
+            login_visible = await page.locator("input#ap_email, input#ap_password, input[name='email']").first.is_visible()
+            if login_visible:
                 raise RuntimeError("Saved auth state is not valid for manual extraction.")
 
             request_client = context.request
