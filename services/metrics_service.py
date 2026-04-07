@@ -414,23 +414,20 @@ def _is_metrics_response_for_merchant(response, expected_merchant_id: str = "") 
     return not merchant_ids or expected_merchant_id in merchant_ids
 
 
-def _apply_current_metrics_window(
+def _apply_metrics_window(
     api_url: str,
-    settings: Settings,
-    current_dt: datetime | None = None,
+    start_dt: datetime,
+    end_dt: datetime,
 ) -> str:
-    now = current_dt or datetime.now(settings.local_timezone)
-    start_dt = now - timedelta(days=1)
-
     replacements = {
         "startRange[year]": str(start_dt.year),
         "startRange[month]": str(start_dt.month - 1),
         "startRange[day]": str(start_dt.day),
-        "startRange[hour]": "0",
-        "endRange[year]": str(now.year),
-        "endRange[month]": str(now.month - 1),
-        "endRange[day]": str(now.day),
-        "endRange[hour]": str(now.hour),
+        "startRange[hour]": str(start_dt.hour),
+        "endRange[year]": str(end_dt.year),
+        "endRange[month]": str(end_dt.month - 1),
+        "endRange[day]": str(end_dt.day),
+        "endRange[hour]": str(end_dt.hour),
     }
 
     parsed = urllib.parse.urlparse(api_url)
@@ -444,18 +441,34 @@ def _apply_current_metrics_window(
     return parsed._replace(query=updated_query).geturl()
 
 
+def _apply_current_metrics_window(
+    api_url: str,
+    settings: Settings,
+    current_dt: datetime | None = None,
+) -> str:
+    now = current_dt or datetime.now(settings.local_timezone)
+    start_dt = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = now.replace(minute=0, second=0, microsecond=0)
+    return _apply_metrics_window(api_url, start_dt, end_dt)
+
+
 def _build_fast_path_target_url(
     api_url_template: str,
     merchant_id: str,
     settings: Settings,
     *,
     detail: bool = False,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
     current_dt: datetime | None = None,
 ) -> str:
     url_template = _build_detail_metrics_url(api_url_template) if detail else _canonicalize_summation_metrics_url(
         api_url_template
     )
-    dated_url = _apply_current_metrics_window(url_template, settings, current_dt=current_dt)
+    if start_dt is not None and end_dt is not None:
+        dated_url = _apply_metrics_window(url_template, start_dt, end_dt)
+    else:
+        dated_url = _apply_current_metrics_window(url_template, settings, current_dt=current_dt)
     return dated_url.replace("{merchant_id}", merchant_id).replace("%7Bmerchant_id%7D", merchant_id)
 
 

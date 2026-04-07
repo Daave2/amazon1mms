@@ -171,3 +171,23 @@ def test_build_store_submission_overlays_lates_and_cancellations_from_detail_pay
     assert normalized["OrderCancellations"] == 2
     assert form_data["lates"] == "0.7 %"
     assert form_data["cancelled"] == "2"
+
+
+def test_build_form_data_truncates_lates_to_match_dashboard():
+    form_data = build_form_data(
+        "Morrisons York",
+        {
+            "OrdersShopped_V2": 139,
+            "RequestedQuantity_V2": 3655,
+            "PickedUnits_V2": 3617,
+            "AverageUPH_V2": 81,
+            "LatePicksRate": 2.8834,
+            "ItemNotFoundRate_V2": 2.3,
+            "ItemFoundRate_V2": 97.7,
+            "OrderCancellations": 6,
+            "TimeAvailable_V2": 0,
+        },
+        current_dt=datetime(2026, 4, 7, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+    )
+
+    assert form_data["lates"] == "2.8 %"

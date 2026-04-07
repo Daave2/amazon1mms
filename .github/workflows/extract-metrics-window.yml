@@ -1,0 +1,198 @@
+name: Extract Metrics Window
+
+on:
+  workflow_dispatch:
+    inputs:
+      stores:
+        description: Comma-separated configured store names. Leave blank for all stores with merchant ids.
+        required: false
+        default: ""
+        type: string
+      window_preset:
+        description: Named date window to extract
+        required: true
+        default: today
+        type: choice
+        options:
+          - today
+          - yesterday
+          - this_week
+          - last_7_days
+          - custom
+      custom_start:
+        description: Custom start in Europe/London, e.g. 2026-04-07 00
+        required: false
+        default: ""
+        type: string
+      custom_end:
+        description: Custom end in Europe/London, e.g. 2026-04-07 12
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  LOGIN_URL: ${{ secrets.LOGIN_URL }}
+  LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
+  LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+  OTP_SECRET_KEY: ${{ secrets.OTP_SECRET_KEY }}
+  TARGET_URL: ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
+  FORM_POST_URL: ${{ secrets.FORM_POST_URL || 'https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse' }}
+  CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright browser
+        run: python -m playwright install chromium
+
+      - name: Download Persistent Data (Fast Path Cache)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: persistent-discovery-data
+          path: .
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Download auth state from previous run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: auth-state
+          path: .
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Ensure auth state is valid
+        run: |
+          python - <<'PY'
+          import asyncio
+          from pathlib import Path
+
+          from playwright.async_api import async_playwright
+
+          from core.config import load_settings
+          from core.utils import optimize_browser_context, safe_close
+          from services.auth_service import check_if_login_needed, prime_master_session
+
+          async def main():
+              settings = load_settings()
+              state_path = Path(settings.storage_state_path)
+
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  try:
+                      session_valid = False
+                      if state_path.exists():
+                          context = await browser.new_context(storage_state=str(state_path))
+                          await optimize_browser_context(context, settings)
+                          page = await context.new_page()
+                          try:
+                              session_valid = not await check_if_login_needed(page, settings.base_dashboard_url, settings)
+                          finally:
+                              await safe_close(page, "Extract auth check page")
+                              await safe_close(context, "Extract auth check context")
+
+                      if session_valid:
+                          print("Existing auth state is valid.")
+                          return
+
+                      print("Auth state missing or expired. Priming a fresh session.")
+                      success = await prime_master_session(browser, settings)
+                      if not success:
+                          raise RuntimeError("Failed to prime a fresh auth session for extract workflow.")
+                  finally:
+                      await safe_close(browser, "Extract auth browser")
+
+          asyncio.run(main())
+          PY
+
+      - name: Run metrics window extractor
+        run: |
+          extra_args=()
+          if [ -n "${{ github.event.inputs.stores }}" ]; then
+            extra_args+=(--stores "${{ github.event.inputs.stores }}")
+          fi
+          if [ "${{ github.event.inputs.window_preset }}" = "custom" ]; then
+            extra_args+=(--start "${{ github.event.inputs.custom_start }}" --end "${{ github.event.inputs.custom_end }}")
+          fi
+
+          python scripts/manual/extract_metrics_window.py \
+            --window-preset "${{ github.event.inputs.window_preset }}" \
+            "${extra_args[@]}"
+
+      - name: Upload extraction artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-window-extract-${{ github.run_id }}
+          path: |
+            output/extracts/
+            output/debug/
+            state.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write extraction summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          extracts_dir = Path("output/extracts")
+          extract_dirs = sorted([path for path in extracts_dir.glob("metrics_window_*") if path.is_dir()], key=lambda path: path.stat().st_mtime)
+
+          lines = [
+              "## Metrics Window Extract",
+              "",
+              f"- Window preset: `{os.getenv('WINDOW_PRESET', '')}`",
+              f"- Stores filter: `{os.getenv('STORE_FILTER', '') or 'all stores'}`",
+          ]
+
+          if extract_dirs:
+              latest = extract_dirs[-1]
+              summary_path = latest / "summary.json"
+              lines.append(f"- Output folder: `{latest}`")
+              if summary_path.exists():
+                  summary = json.loads(summary_path.read_text(encoding='utf-8'))
+                  lines.append(f"- Window start: `{summary.get('windowStart', '')}`")
+                  lines.append(f"- Window end: `{summary.get('windowEnd', '')}`")
+                  lines.append(f"- Stores extracted: `{summary.get('storeCount', 0)}`")
+              else:
+                  lines.append("- `summary.json` was not generated.")
+          else:
+              lines.append("- No extract output folder was found.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+        env:
+          WINDOW_PRESET: ${{ github.event.inputs.window_preset }}
+          STORE_FILTER: ${{ github.event.inputs.stores }}

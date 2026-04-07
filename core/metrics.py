@@ -1,4 +1,5 @@
 from datetime import datetime
+from math import trunc
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,11 @@ def _first_not_none(*values: float | None) -> float:
         if value is not None:
             return value
     return 0.0
+
+
+def _format_truncated_percent(value: float) -> str:
+    truncated = trunc((value or 0.0) * 10) / 10
+    return f"{truncated:.1f} %"
 
 
 def _deduplicate_master_records(records: list[AmazonShopperRecord]) -> list[AmazonShopperRecord]:
@@ -110,6 +116,6 @@ def build_form_data(
         "inf": f"{(normalized_metrics.get('ItemNotFoundRate_V2') or 0.0):.1f} %",
         "found": f"{(normalized_metrics.get('ItemFoundRate_V2') or 0.0):.1f} %",
         "cancelled": str(int(normalized_metrics.get("OrderCancellations") or 0)),
-        "lates": f"{lates_val:.1f} %",
+        "lates": _format_truncated_percent(lates_val),
         "time_available": format_time_available(normalized_metrics.get("TimeAvailable_V2", 0.0)),
     }

@@ -400,6 +400,30 @@ def test_build_fast_path_target_url_prefers_summation_metrics_template():
     assert "endRange%5Bhour%5D=11" in target_url
 
 
+def test_build_fast_path_target_url_respects_explicit_window():
+    state = ScraperState()
+    start_dt = london_datetime(2026, 4, 1, 6, 0)
+    end_dt = london_datetime(2026, 4, 7, 12, 0)
+
+    target_url = metrics_service._build_fast_path_target_url(
+        "https://example.com/api/summationMetrics?merchantIds%5B%5D={merchant_id}",
+        "MID123",
+        state.settings,
+        start_dt=start_dt,
+        end_dt=end_dt,
+    )
+
+    assert "api/summationMetrics" in target_url
+    assert "MID123" in target_url
+    assert "startRange%5Byear%5D=2026" in target_url
+    assert "startRange%5Bmonth%5D=3" in target_url
+    assert "startRange%5Bday%5D=1" in target_url
+    assert "startRange%5Bhour%5D=6" in target_url
+    assert "endRange%5Bmonth%5D=3" in target_url
+    assert "endRange%5Bday%5D=7" in target_url
+    assert "endRange%5Bhour%5D=12" in target_url
+
+
 def test_metrics_response_matcher_rejects_wrong_merchant_id():
     class Response:
         status = 200
