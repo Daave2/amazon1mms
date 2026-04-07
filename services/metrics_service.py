@@ -71,7 +71,19 @@ def _selection_matches_target(
     store_name: str,
     settings: Settings | None = None,
 ) -> bool:
+    def _normalized_tokens(value: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", value.lower())
+
+    def _is_token_subsequence(shorter_tokens: list[str], longer_tokens: list[str]) -> bool:
+        if not shorter_tokens or len(shorter_tokens) > len(longer_tokens):
+            return False
+        for index in range(len(longer_tokens) - len(shorter_tokens) + 1):
+            if longer_tokens[index : index + len(shorter_tokens)] == shorter_tokens:
+                return True
+        return False
+
     selected_norm = resolve_dropdown_name(selected_text, settings)
+    selected_tokens = _normalized_tokens(selected_norm)
     candidate_norms = {
         resolve_dropdown_name(dropdown_name, settings),
         resolve_dropdown_name(store_name, settings),
@@ -80,9 +92,19 @@ def _selection_matches_target(
     for candidate in candidate_norms:
         if not candidate:
             continue
-        if candidate in selected_norm or selected_norm in candidate:
+        candidate_tokens = _normalized_tokens(candidate)
+        if selected_norm == candidate:
             return True
-        if difflib.SequenceMatcher(None, selected_norm, candidate).ratio() >= 0.72:
+        if _is_token_subsequence(candidate_tokens, selected_tokens) or _is_token_subsequence(
+            selected_tokens,
+            candidate_tokens,
+        ):
+            return True
+        if (len(selected_tokens) > 1 or len(candidate_tokens) > 1) and difflib.SequenceMatcher(
+            None,
+            selected_norm,
+            candidate,
+        ).ratio() >= 0.72:
             return True
     return False
 
@@ -285,8 +307,40 @@ async def _dump_dropdown_debug(page: Page, store_name: str, settings: Settings):
         app_logger.warning(f"[{store_name}] Failed to save dropdown debug HTML: {exc}")
 
 
+def _canonicalize_summation_metrics_url(api_url: str) -> str:
+    canonical_url = api_url.replace("/api/metrics?", "/api/summationMetrics?")
+    canonical_url = canonical_url.replace("/metrics?", "/summationMetrics?")
+    return canonical_url
+
+
+def _build_generic_api_template(request_url: str) -> str:
+    canonical_url = _canonicalize_summation_metrics_url(request_url)
+    return re.sub(
+        r"merchantIds(?:%5B%5D|\[\])=[^&]*",
+        "merchantIds%5B%5D={merchant_id}",
+        canonical_url,
+    )
+
+
+def _extract_merchant_ids_from_url(request_url: str) -> list[str]:
+    parsed = urllib.parse.urlparse(request_url)
+    params = urllib.parse.parse_qs(parsed.query)
+    return [merchant_id.strip() for merchant_id in (params.get("merchantIds[]") or params.get("merchantIds") or [])]
+
+
+def _is_metrics_response_for_merchant(response, expected_merchant_id: str = "") -> bool:
+    if response.status != 200 or not any(key in response.url for key in ["summationMetrics", "api/metrics"]):
+        return False
+
+    if not expected_merchant_id:
+        return True
+
+    merchant_ids = _extract_merchant_ids_from_url(response.url)
+    return not merchant_ids or expected_merchant_id in merchant_ids
+
+
 def _build_fast_path_target_url(api_url_template: str, merchant_id: str, settings: Settings) -> str:
-    detail_template = api_url_template.replace("/summationMetrics?", "/metrics?")
+    detail_template = _canonicalize_summation_metrics_url(api_url_template)
     current_hour = datetime.now(settings.local_timezone).hour
     if "endRange%5Bhour%5D=" in detail_template:
         detail_template = re.sub(r"endRange%5Bhour%5D=\d+", f"endRange%5Bhour%5D={current_hour}", detail_template)
@@ -424,6 +478,7 @@ async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: Scraper
     settings = state.settings
     store_name = work_item.store_name
     dropdown_name = resolve_dropdown_name(work_item.dropdown_name, settings)
+    expected_merchant_id = work_item.merchant_id.strip()
 
     dropdown_trigger = page.locator("#store-selector-dropdown")
     if not page.url.startswith(settings.base_dashboard_url) or not await dropdown_trigger.is_visible():
@@ -434,7 +489,7 @@ async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: Scraper
 
     refresh_button = page.get_by_role("button", name="Refresh")
     async with page.expect_response(
-        lambda response: any(key in response.url for key in ["summationMetrics", "api/metrics"]) and response.status == 200,
+        lambda response: _is_metrics_response_for_merchant(response, expected_merchant_id),
         timeout=timeout,
     ) as response_info:
         await expect(refresh_button).to_be_visible(timeout=settings.wait_timeout_ms)
@@ -442,14 +497,28 @@ async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: Scraper
 
     response = await response_info.value
     api_data = await response.json()
-
     request_url = response.url
+    summary_url = _canonicalize_summation_metrics_url(request_url)
+    if summary_url != request_url:
+        try:
+            summary_response = await page.context.request.get(summary_url, timeout=timeout)
+            if summary_response.status == 200:
+                api_data = await summary_response.json()
+                request_url = summary_response.url
+                app_logger.info(f"[{store_name}] Refetched summationMetrics for canonical store totals.")
+            else:
+                app_logger.warning(
+                    f"[{store_name}] Summation metrics refetch returned {summary_response.status}; using original response."
+                )
+        except Exception as exc:
+            app_logger.warning(f"[{store_name}] Failed to refetch summation metrics: {exc}")
+
     parsed = urllib.parse.urlparse(request_url)
     params = urllib.parse.parse_qs(parsed.query)
     cache_updated = False
 
     if "summationMetrics" in request_url or "api/metrics" in request_url:
-        generic_url = re.sub(r"merchantIds%5B%5D=[^&]*", "merchantIds%5B%5D={merchant_id}", request_url)
+        generic_url = _build_generic_api_template(request_url)
         if state.cache.set_api_url_template(generic_url):
             cache_updated = True
             app_logger.info(f"[{store_name}] Discovery: Captured API Template: {generic_url[:100]}...")

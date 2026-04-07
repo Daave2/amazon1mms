@@ -375,6 +375,28 @@ def test_load_cached_dropdown_stores_uses_cached_snapshot_for_queue_filtering():
     assert state.live_dropdown_store_count == 2
 
 
+def test_build_fast_path_target_url_prefers_summation_metrics_template():
+    state = ScraperState()
+
+    target_url = metrics_service._build_fast_path_target_url(
+        "https://example.com/api/metrics?merchantIds%5B%5D={merchant_id}&endRange%5Bhour%5D=9",
+        "MID123",
+        state.settings,
+    )
+
+    assert "api/summationMetrics" in target_url
+    assert "MID123" in target_url
+
+
+def test_metrics_response_matcher_rejects_wrong_merchant_id():
+    class Response:
+        status = 200
+        url = "https://example.com/api/metrics?merchantIds%5B%5D=OTHER"
+
+    assert metrics_service._is_metrics_response_for_merchant(Response(), "MID123") is False
+    assert metrics_service._is_metrics_response_for_merchant(Response(), "") is True
+
+
 @pytest.mark.asyncio
 async def test_fetch_metrics_fast_path_retries_transient_503_then_succeeds(monkeypatch):
     sleep_calls: list[float] = []
@@ -505,7 +527,10 @@ async def test_process_ui_store_collects_metrics_and_updates_cache(monkeypatch):
     assert queued["store"] == "Belle Vale Morrisons"
     assert queued["orders"] == "8"
     assert state.run_failures == []
-    assert state.cache.api_url_template == "https://example.com/api/metrics?merchantIds%5B%5D={merchant_id}&endRange%5Bhour%5D=9"
+    assert (
+        state.cache.api_url_template
+        == "https://example.com/api/summationMetrics?merchantIds%5B%5D={merchant_id}&endRange%5Bhour%5D=9"
+    )
     assert state.cache.merchant_id_cache["Belle Vale Morrisons"] == "DISCOVERED"
 
 

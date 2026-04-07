@@ -19,6 +19,7 @@ def test_selection_matches_target_tolerates_formatting_variants():
     assert _selection_matches_target("Wellington Gardens", "wellington gardens", "Wellington Gardens")
     assert _selection_matches_target("Oxford", "carterton", "Carterton Morrisons")
     assert not _selection_matches_target("Morrisons Aberdeen", "basingstoke", "Morrisons Basingstoke")
+    assert not _selection_matches_target("Wellington", "Welling", "Morrisons Welling")
 
 
 def test_resolve_dropdown_name_applies_special_store_mappings():
