@@ -5,7 +5,7 @@ import difflib
 import os
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from playwright.async_api import Page, TimeoutError, expect
 
@@ -313,6 +313,12 @@ def _canonicalize_summation_metrics_url(api_url: str) -> str:
     return canonical_url
 
 
+def _build_detail_metrics_url(api_url: str) -> str:
+    detail_url = api_url.replace("/api/summationMetrics?", "/api/metrics?")
+    detail_url = detail_url.replace("/summationMetrics?", "/metrics?")
+    return detail_url
+
+
 def _build_generic_api_template(request_url: str) -> str:
     canonical_url = _canonicalize_summation_metrics_url(request_url)
     return re.sub(
@@ -339,16 +345,62 @@ def _is_metrics_response_for_merchant(response, expected_merchant_id: str = "") 
     return not merchant_ids or expected_merchant_id in merchant_ids
 
 
-def _build_fast_path_target_url(api_url_template: str, merchant_id: str, settings: Settings) -> str:
-    detail_template = _canonicalize_summation_metrics_url(api_url_template)
-    current_hour = datetime.now(settings.local_timezone).hour
-    if "endRange%5Bhour%5D=" in detail_template:
-        detail_template = re.sub(r"endRange%5Bhour%5D=\d+", f"endRange%5Bhour%5D={current_hour}", detail_template)
-    return detail_template.replace("{merchant_id}", merchant_id)
+def _apply_current_metrics_window(
+    api_url: str,
+    settings: Settings,
+    current_dt: datetime | None = None,
+) -> str:
+    now = current_dt or datetime.now(settings.local_timezone)
+    start_dt = now - timedelta(days=1)
+
+    replacements = {
+        "startRange[year]": str(start_dt.year),
+        "startRange[month]": str(start_dt.month - 1),
+        "startRange[day]": str(start_dt.day),
+        "startRange[hour]": "0",
+        "endRange[year]": str(now.year),
+        "endRange[month]": str(now.month - 1),
+        "endRange[day]": str(now.day),
+        "endRange[hour]": str(now.hour),
+    }
+
+    parsed = urllib.parse.urlparse(api_url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    seen_keys = {key for key, _value in query_items}
+    updated_query_items = [(key, replacements.get(key, value)) for key, value in query_items]
+    for key, value in replacements.items():
+        if key not in seen_keys:
+            updated_query_items.append((key, value))
+    updated_query = urllib.parse.urlencode(updated_query_items, doseq=True)
+    return parsed._replace(query=updated_query).geturl()
 
 
-def build_store_submission(store_name: str, api_data: list[dict] | dict, settings: Settings) -> tuple[dict[str, str], dict[str, float]]:
+def _build_fast_path_target_url(
+    api_url_template: str,
+    merchant_id: str,
+    settings: Settings,
+    *,
+    detail: bool = False,
+    current_dt: datetime | None = None,
+) -> str:
+    url_template = _build_detail_metrics_url(api_url_template) if detail else _canonicalize_summation_metrics_url(
+        api_url_template
+    )
+    dated_url = _apply_current_metrics_window(url_template, settings, current_dt=current_dt)
+    return dated_url.replace("{merchant_id}", merchant_id).replace("%7Bmerchant_id%7D", merchant_id)
+
+
+def build_store_submission(
+    store_name: str,
+    api_data: list[dict] | dict,
+    settings: Settings,
+    detail_api_data: list[dict] | dict | None = None,
+) -> tuple[dict[str, str], dict[str, float]]:
     normalized_metrics = normalize_metrics_payload(api_data)
+    if detail_api_data is not None:
+        detail_metrics = normalize_metrics_payload(detail_api_data)
+        normalized_metrics["LatePicksRate"] = detail_metrics.get("LatePicksRate", 0.0)
+        normalized_metrics["OrderCancellations"] = detail_metrics.get("OrderCancellations", 0.0)
     form_data = build_form_data(store_name, normalized_metrics, local_timezone=settings.local_timezone)
     return form_data, normalized_metrics
 
@@ -408,6 +460,19 @@ async def fetch_metrics_fast_path(request_client, target_url: str, store_name: s
                 continue
 
             raise RuntimeError(f"API Fetch failed: {resp.status}")
+
+
+async def fetch_metrics_pair_fast_path(
+    request_client,
+    summary_url: str,
+    detail_url: str,
+    store_name: str,
+    state: ScraperState,
+    timeout: int,
+):
+    summary_data = await fetch_metrics_fast_path(request_client, summary_url, store_name, state, timeout)
+    detail_data = await fetch_metrics_fast_path(request_client, detail_url, store_name, state, timeout)
+    return summary_data, detail_data
 
 
 async def _fetch_metrics_fast_path(page: Page, target_url: str, store_name: str, state: ScraperState, timeout: int):
@@ -496,22 +561,38 @@ async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: Scraper
         await refresh_button.first.dispatch_event("click")
 
     response = await response_info.value
-    api_data = await response.json()
+    response_api_data = await response.json()
     request_url = response.url
     summary_url = _canonicalize_summation_metrics_url(request_url)
-    if summary_url != request_url:
+    detail_url = _build_detail_metrics_url(summary_url)
+
+    summary_api_data = response_api_data if summary_url == request_url else None
+    detail_api_data = response_api_data if detail_url == request_url else None
+
+    if summary_api_data is None:
         try:
             summary_response = await page.context.request.get(summary_url, timeout=timeout)
             if summary_response.status == 200:
-                api_data = await summary_response.json()
+                summary_api_data = await summary_response.json()
                 request_url = summary_response.url
                 app_logger.info(f"[{store_name}] Refetched summationMetrics for canonical store totals.")
             else:
-                app_logger.warning(
-                    f"[{store_name}] Summation metrics refetch returned {summary_response.status}; using original response."
-                )
+                raise RuntimeError(f"Summation metrics refetch returned {summary_response.status}")
         except Exception as exc:
             app_logger.warning(f"[{store_name}] Failed to refetch summation metrics: {exc}")
+            raise
+
+    if detail_api_data is None:
+        try:
+            detail_response = await page.context.request.get(detail_url, timeout=timeout)
+            if detail_response.status == 200:
+                detail_api_data = await detail_response.json()
+                app_logger.info(f"[{store_name}] Refetched metrics detail for lates and cancellations.")
+            else:
+                raise RuntimeError(f"Detail metrics refetch returned {detail_response.status}")
+        except Exception as exc:
+            app_logger.warning(f"[{store_name}] Failed to refetch detail metrics: {exc}")
+            raise
 
     parsed = urllib.parse.urlparse(request_url)
     params = urllib.parse.parse_qs(parsed.query)
@@ -534,7 +615,7 @@ async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: Scraper
     if cache_updated:
         await state.cache.save()
 
-    return api_data
+    return summary_api_data, detail_api_data
 
 
 async def process_fast_path_store(
@@ -559,11 +640,29 @@ async def process_fast_path_store(
         if not state.cache.api_url_template or not work_item.merchant_id:
             raise RuntimeError("Fast-path route requires both an API template and a merchant ID")
 
-        target_url = _build_fast_path_target_url(state.cache.api_url_template, work_item.merchant_id, state.settings)
-        api_data = await fetch_metrics_fast_path(request_client, target_url, store_name, state, METRICS_TIMEOUT)
+        summary_url = _build_fast_path_target_url(state.cache.api_url_template, work_item.merchant_id, state.settings)
+        detail_url = _build_fast_path_target_url(
+            state.cache.api_url_template,
+            work_item.merchant_id,
+            state.settings,
+            detail=True,
+        )
+        api_data, detail_api_data = await fetch_metrics_pair_fast_path(
+            request_client,
+            summary_url,
+            detail_url,
+            store_name,
+            state,
+            METRICS_TIMEOUT,
+        )
         app_logger.info(f"[{store_name}] API data fetched successfully (Fast Path).")
 
-        form_data, normalized_metrics = build_store_submission(store_name, api_data, state.settings)
+        form_data, normalized_metrics = build_store_submission(
+            store_name,
+            api_data,
+            state.settings,
+            detail_api_data=detail_api_data,
+        )
         await submission_target.enqueue_submission(form_data)
 
         duration = asyncio.get_running_loop().time() - start_ts
@@ -608,10 +707,15 @@ async def process_ui_store(
             if submission_target is None:
                 raise RuntimeError("A submission manager or submission queue is required")
 
-            api_data = await collect_metrics_via_ui(page, work_item, state, timeout=METRICS_TIMEOUT)
+            api_data, detail_api_data = await collect_metrics_via_ui(page, work_item, state, timeout=METRICS_TIMEOUT)
 
             current_stage = "general"
-            form_data, normalized_metrics = build_store_submission(store_name, api_data, state.settings)
+            form_data, normalized_metrics = build_store_submission(
+                store_name,
+                api_data,
+                state.settings,
+                detail_api_data=detail_api_data,
+            )
             await submission_target.enqueue_submission(form_data)
 
             duration = asyncio.get_running_loop().time() - start_ts

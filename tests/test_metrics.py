@@ -1,6 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from core.config import load_settings
 from core.metrics import build_form_data, normalize_metrics_payload
 
 
@@ -96,3 +97,77 @@ def test_normalize_metrics_payload_for_detailed_records_deduplicates_profiles():
         "OrderCancellations": 2,
         "TimeAvailable_V2": 9_000_000,
     }
+
+
+def test_build_store_submission_overlays_lates_and_cancellations_from_detail_payload():
+    from services.metrics_service import build_store_submission
+
+    settings = load_settings()
+    summary_payload = {
+        "OrdersShopped_V2": 268,
+        "RequestedQuantity_V2": 6828,
+        "PickedUnits_V2": 6675,
+        "AverageUPH_V2": 92,
+        "ItemNotFoundRate_V2": 3.6,
+        "ItemFoundRate_V2": 96.4,
+        "TimeAvailable_V2": 3_600_000,
+    }
+    detail_payload = [
+        {
+            "type": "MASTER",
+            "shopperName": "Janine",
+            "metrics": {
+                "OrdersShopped_V2": 16,
+                "RequestedQuantity_V2": 428,
+                "PickedUnits_V2": 421,
+                "PickTimeInSec_V2": 17_410.566,
+                "LatePicksRate": 12.5,
+                "ItemNotFoundRate_V2": 3.27,
+                "OrderCancellations": 0,
+                "TimeAvailable_V2": 19_584_956,
+            },
+        },
+        {
+            "type": "MASTER",
+            "shopperName": "Name Not Found",
+            "metrics": {
+                "OrdersShopped_V2": 0,
+                "RequestedQuantity_V2": 0,
+                "PickedUnits_V2": 0,
+                "PickTimeInSec_V2": 0,
+                "LatePicksRate": 0,
+                "ItemNotFoundRate_V2": 0,
+                "OrderCancellations": 2,
+                "TimeAvailable_V2": 0,
+            },
+        },
+        {
+            "type": "MASTER",
+            "shopperName": "Other",
+            "metrics": {
+                "OrdersShopped_V2": 252,
+                "RequestedQuantity_V2": 6400,
+                "PickedUnits_V2": 6254,
+                "PickTimeInSec_V2": 249_810.196,
+                "LatePicksRate": 0,
+                "ItemNotFoundRate_V2": 3.62,
+                "OrderCancellations": 0,
+                "TimeAvailable_V2": 288_766_514,
+            },
+        },
+    ]
+
+    form_data, normalized = build_store_submission(
+        "Morrisons Welwyn",
+        summary_payload,
+        settings,
+        detail_api_data=detail_payload,
+    )
+
+    assert normalized["OrdersShopped_V2"] == 268
+    assert normalized["RequestedQuantity_V2"] == 6828
+    assert normalized["PickedUnits_V2"] == 6675
+    assert normalized["LatePicksRate"] == 0.7462686567164178
+    assert normalized["OrderCancellations"] == 2
+    assert form_data["lates"] == "0.7 %"
+    assert form_data["cancelled"] == "2"

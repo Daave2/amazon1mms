@@ -10,9 +10,10 @@ from services import metrics_service
 
 
 class FakeRequestResponse:
-    def __init__(self, status, payload=None):
+    def __init__(self, status, payload=None, url="https://example.com/api/summationMetrics?merchantIds%5B%5D=DISCOVERED&endRange%5Bhour%5D=9"):
         self.status = status
         self._payload = payload or {}
+        self.url = url
 
     async def json(self):
         return self._payload
@@ -24,8 +25,12 @@ class FakeRequestClient:
 
     async def get(self, _url, timeout):
         assert timeout == 45_000
-        status = self.responses.pop(0) if self.responses else 500
-        return FakeRequestResponse(status, {"metrics": {"OrdersShopped_V2": 8}})
+        next_response = self.responses.pop(0) if self.responses else 500
+        if isinstance(next_response, tuple):
+            status, payload = next_response
+            return FakeRequestResponse(status, payload, url=_url)
+        status = next_response
+        return FakeRequestResponse(status, {"metrics": {"OrdersShopped_V2": 8}}, url=_url)
 
 
 class FakeContext:
@@ -377,15 +382,22 @@ def test_load_cached_dropdown_stores_uses_cached_snapshot_for_queue_filtering():
 
 def test_build_fast_path_target_url_prefers_summation_metrics_template():
     state = ScraperState()
+    fixed_dt = london_datetime(2026, 4, 7, 11, 0)
 
     target_url = metrics_service._build_fast_path_target_url(
         "https://example.com/api/metrics?merchantIds%5B%5D={merchant_id}&endRange%5Bhour%5D=9",
         "MID123",
         state.settings,
+        current_dt=fixed_dt,
     )
 
     assert "api/summationMetrics" in target_url
     assert "MID123" in target_url
+    assert "startRange%5Bmonth%5D=3" in target_url
+    assert "startRange%5Bday%5D=6" in target_url
+    assert "endRange%5Bmonth%5D=3" in target_url
+    assert "endRange%5Bday%5D=7" in target_url
+    assert "endRange%5Bhour%5D=11" in target_url
 
 
 def test_metrics_response_matcher_rejects_wrong_merchant_id():
@@ -505,7 +517,7 @@ async def test_process_ui_store_collects_metrics_and_updates_cache(monkeypatch):
     monkeypatch.setattr(metrics_service, "expect", lambda _locator: FakeExpectation())
 
     page = FakePage()
-    page.context = FakeContext(page)
+    page.context = FakeContext(page, request_client=FakeRequestClient([200]))
 
     state = ScraperState()
     submission_queue = asyncio.Queue()
@@ -552,7 +564,7 @@ async def test_fast_path_worker_completes_without_creating_page():
         )
     )
 
-    browser = FakeBrowser(page=None, request_client=FakeRequestClient([200]))
+    browser = FakeBrowser(page=None, request_client=FakeRequestClient([200, 200]))
 
     await scraper.fast_path_worker_task(
         worker_id=1,
