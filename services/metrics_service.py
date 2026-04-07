@@ -146,6 +146,9 @@ async def _visible_dropdown_overlay(page: Page):
         ".dropdown-content:visible",
         ".dropdown-popover:visible",
         ".dropdown-list:visible",
+        "li[id^='store-selector-option-']:visible",
+        "li.dropdown-option:visible",
+        "li.dropdown-option-selected:visible",
     ]
     for selector in selectors:
         overlay = page.locator(selector).first
@@ -159,17 +162,83 @@ async def _visible_dropdown_overlay(page: Page):
 
 async def _open_store_dropdown(page: Page, store_name: str):
     dropdown_trigger = page.locator("#store-selector-dropdown")
+
+    async def _try_open_with_strategies() -> tuple[bool, Any | None]:
+        clickable_targets = [
+            dropdown_trigger.first,
+            dropdown_trigger.locator("button, [role='button'], .chevron, kat-icon").first,
+        ]
+        for target in clickable_targets:
+            try:
+                if await target.count() == 0 or not await target.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            for action_name, action in (
+                ("click", lambda: target.click(force=True)),
+                ("enter", lambda: target.press("Enter")),
+                ("space", lambda: target.press(" ")),
+                (
+                    "dispatch_click",
+                    lambda: target.dispatch_event("click"),
+                ),
+            ):
+                try:
+                    await action()
+                    await asyncio.sleep(1)
+                    overlay = await _visible_dropdown_overlay(page)
+                    if overlay is not None:
+                        app_logger.info(f"[{store_name}] Store dropdown opened via {action_name}.")
+                        return True, overlay
+                except Exception as exc:
+                    app_logger.debug(f"[{store_name}] Dropdown open attempt via {action_name} failed: {exc}")
+
+        try:
+            opened = await page.evaluate(
+                """() => {
+                    const trigger = document.querySelector("#store-selector-dropdown");
+                    if (!trigger) {
+                        return false;
+                    }
+                    const target =
+                        trigger.querySelector("button, [role='button'], .chevron, kat-icon") || trigger;
+                    target.click();
+                    return true;
+                }"""
+            )
+            if opened:
+                await asyncio.sleep(1)
+                overlay = await _visible_dropdown_overlay(page)
+                if overlay is not None:
+                    app_logger.info(f"[{store_name}] Store dropdown opened via DOM click fallback.")
+                    return True, overlay
+        except Exception as exc:
+            app_logger.debug(f"[{store_name}] DOM click fallback failed: {exc}")
+
+        return False, None
+
     try:
         await expect(dropdown_trigger).to_be_visible(timeout=30000)
         for _ in range(3):
-            await dropdown_trigger.first.click(force=True)
-            await asyncio.sleep(1)
-            overlay = await _visible_dropdown_overlay(page)
-            if overlay is not None:
+            opened, overlay = await _try_open_with_strategies()
+            if opened and overlay is not None:
                 return dropdown_trigger, overlay
     except Exception as exc:
         app_logger.warning(f"[{store_name}] Failed to click dropdown trigger: {exc}")
-        await page.get_by_text("Select a store").first.click(force=True)
+        fallback_labels = [
+            page.get_by_text("Select a store").first,
+            page.get_by_text("Stores").first,
+        ]
+        for fallback in fallback_labels:
+            try:
+                await fallback.click(force=True)
+                await asyncio.sleep(1)
+                overlay = await _visible_dropdown_overlay(page)
+                if overlay is not None:
+                    return dropdown_trigger, overlay
+            except Exception:
+                continue
 
     await asyncio.sleep(2)
     overlay = await _visible_dropdown_overlay(page)
