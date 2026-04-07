@@ -1,0 +1,184 @@
+name: Probe Late Picks
+
+on:
+  workflow_dispatch:
+    inputs:
+      store:
+        description: Store name to probe, exactly as configured in urls.csv
+        required: true
+        type: string
+      dropdown_name:
+        description: Optional explicit dropdown name if it differs from the configured store name
+        required: false
+        default: ""
+        type: string
+      max_wait_seconds:
+        description: Maximum seconds to observe post-refresh traffic
+        required: false
+        default: "15"
+        type: string
+      quiet_seconds:
+        description: Stop after this many quiet seconds with no new JSON responses
+        required: false
+        default: "2.5"
+        type: string
+      poll_interval_ms:
+        description: DOM polling cadence in milliseconds
+        required: false
+        default: "100"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  LOGIN_URL: ${{ secrets.LOGIN_URL }}
+  LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
+  LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+  OTP_SECRET_KEY: ${{ secrets.OTP_SECRET_KEY }}
+  TARGET_URL: ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
+  FORM_POST_URL: ${{ secrets.FORM_POST_URL || 'https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse' }}
+  CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright browser
+        run: python -m playwright install chromium
+
+      - name: Download auth state from previous run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: auth-state
+          path: .
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Ensure auth state is valid
+        run: |
+          python - <<'PY'
+          import asyncio
+          from pathlib import Path
+
+          from playwright.async_api import async_playwright
+
+          from core.config import load_settings
+          from core.utils import optimize_browser_context, safe_close
+          from services.auth_service import check_if_login_needed, prime_master_session
+
+          async def main():
+              settings = load_settings()
+              state_path = Path(settings.storage_state_path)
+
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  try:
+                      session_valid = False
+                      if state_path.exists():
+                          context = await browser.new_context(storage_state=str(state_path))
+                          await optimize_browser_context(context, settings)
+                          page = await context.new_page()
+                          try:
+                              session_valid = not await check_if_login_needed(page, settings.base_dashboard_url, settings)
+                          finally:
+                              await safe_close(page, "Probe auth check page")
+                              await safe_close(context, "Probe auth check context")
+
+                      if session_valid:
+                          print("Existing auth state is valid.")
+                          return
+
+                      print("Auth state missing or expired. Priming a fresh session.")
+                      success = await prime_master_session(browser, settings)
+                      if not success:
+                          raise RuntimeError("Failed to prime a fresh auth session for the late picks probe workflow.")
+                  finally:
+                      await safe_close(browser, "Probe auth browser")
+
+          asyncio.run(main())
+          PY
+
+      - name: Run late picks probe
+        run: |
+          extra_args=()
+          if [ -n "${{ github.event.inputs.dropdown_name }}" ]; then
+            extra_args+=(--dropdown-name "${{ github.event.inputs.dropdown_name }}")
+          fi
+
+          python scripts/debug/late_picks_probe.py \
+            --store "${{ github.event.inputs.store }}" \
+            "${extra_args[@]}" \
+            --max-wait-seconds "${{ github.event.inputs.max_wait_seconds }}" \
+            --quiet-seconds "${{ github.event.inputs.quiet_seconds }}" \
+            --poll-interval-ms "${{ github.event.inputs.poll_interval_ms }}"
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: late-picks-probe-${{ github.run_id }}
+          path: |
+            output/debug/
+            state.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write probe summary to GitHub step summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          debug_dir = Path("output/debug")
+          probe_dirs = sorted([path for path in debug_dir.glob("late_probe_*") if path.is_dir()], key=lambda path: path.stat().st_mtime)
+
+          lines = [
+              "## Late Picks Probe",
+              "",
+              f"- Store: `{os.getenv('STORE_NAME', '')}`",
+          ]
+
+          if probe_dirs:
+              latest = probe_dirs[-1]
+              summary_path = latest / "probe_summary.json"
+              lines.append(f"- Output folder: `{latest}`")
+              if summary_path.exists():
+                  summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                  lines.append(f"- Final Late Picks: `{summary.get('finalSnapshot', {}).get('valueText', 'not found')}`")
+                  lines.append(f"- Captured JSON responses: `{summary.get('responseCount', 0)}`")
+                  lines.append(f"- Likely response ids: `{summary.get('likelyResponseIds', [])}`")
+              else:
+                  lines.append("- `probe_summary.json` was not generated.")
+          else:
+              lines.append("- No probe output folder was found.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+        env:
+          STORE_NAME: ${{ github.event.inputs.store }}
