@@ -134,6 +134,10 @@ def _select_stores(store_rows: list[dict[str, str]], store_filter: str, cache: C
     return prepared
 
 
+def _store_slug(store_name: str) -> str:
+    return store_name.lower().replace(" ", "_").replace("/", "_")
+
+
 async def run_extraction(args: argparse.Namespace):
     settings = load_settings()
     ensure_directory(settings.output_dir)
@@ -195,7 +199,9 @@ async def run_extraction(args: argparse.Namespace):
             app_logger.info("Saved auth state is valid for manual extraction.")
 
             request_client = context.request
-            for index, store in enumerate(selected_stores, start=1):
+            state.browser_worker_pool_size = settings.fast_path_max_concurrency
+
+            async def extract_single_store(index: int, store: dict[str, str]):
                 store_name = store["store_name"]
                 merchant_id = store["merchant_id"]
                 app_logger.info("[%s/%s] Starting extraction for %s", index, len(selected_stores), store_name)
@@ -225,9 +231,8 @@ async def run_extraction(args: argparse.Namespace):
                         45_000,
                     )
 
-                    safe_store_slug = store_name.lower().replace(" ", "_").replace("/", "_")
-                    summary_path = responses_dir / f"{safe_store_slug}_summary.json"
-                    detail_path = responses_dir / f"{safe_store_slug}_detail.json"
+                    summary_path = responses_dir / f"{_store_slug(store_name)}_summary.json"
+                    detail_path = responses_dir / f"{_store_slug(store_name)}_detail.json"
                     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
                     detail_path.write_text(json.dumps(detail_payload, indent=2), encoding="utf-8")
 
@@ -275,6 +280,9 @@ async def run_extraction(args: argparse.Namespace):
                 except Exception as exc:
                     failures.append({"store": store_name, "error": str(exc)})
                     app_logger.exception("[%s/%s] Extraction failed for %s: %s", index, len(selected_stores), store_name, exc)
+            await asyncio.gather(
+                *(extract_single_store(index, store) for index, store in enumerate(selected_stores, start=1))
+            )
     finally:
         await safe_close(page, "Manual extraction page")
         await safe_close(context, "Manual extraction context")
