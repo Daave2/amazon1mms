@@ -35,6 +35,7 @@ DEFAULT_QUIET_SECONDS = 2.5
 DEFAULT_POLL_INTERVAL_MS = 100
 DEFAULT_ATTRIBUTION_GAP_MS = 2500
 DEFAULT_DASHBOARD_READY_TIMEOUT_MS = 45000
+DEFAULT_POST_QUIET_GRACE_SECONDS = 4.0
 
 LATE_PROBE_SCRIPT = r"""
 (() => {
@@ -226,6 +227,50 @@ LATE_PROBE_SCRIPT = r"""
     const label = labelCandidates[0];
     const labelText = normalizeText(label.text);
     const labelFullText = normalizeText(label.element.textContent || labelText);
+
+    const headerCell = label.element.closest('kat-table-cell, th, [role="columnheader"]');
+    const headerRow = headerCell ? headerCell.parentElement : null;
+    if (headerCell && headerRow) {
+      const headerCells = Array.from(headerRow.children || []);
+      const columnIndex = headerCells.indexOf(headerCell);
+      if (columnIndex >= 0) {
+        let rowCursor = headerRow.nextElementSibling;
+        while (rowCursor) {
+          const valueCells = Array.from(rowCursor.children || []);
+          const valueCell = valueCells[columnIndex];
+          if (valueCell && isVisible(valueCell)) {
+            const valueTextRaw = normalizeText(ownText(valueCell) || valueCell.textContent || "");
+            const extracted = extractPercent(valueTextRaw);
+            if (extracted) {
+              return {
+                found: true,
+                searchedAtMs,
+                labelText,
+                valueText: extracted,
+                labelPath: cssPath(label.element),
+                valuePath: cssPath(valueCell),
+                containerPath: cssPath(rowCursor),
+                containerText: normalizeText(rowCursor.textContent || "").slice(0, 600),
+                fallbackPercents,
+              };
+            }
+            return {
+              found: false,
+              searchedAtMs,
+              reason: "late_value_blank",
+              labelText,
+              labelPath: cssPath(label.element),
+              valuePath: cssPath(valueCell),
+              containerPath: cssPath(rowCursor),
+              containerText: normalizeText(rowCursor.textContent || "").slice(0, 600),
+              fallbackPercents,
+            };
+          }
+          rowCursor = rowCursor.nextElementSibling;
+        }
+      }
+    }
+
     const inlineMatch = labelFullText.match(/late\s*picks?.*?(\d+(?:\.\d+)?\s*%)/i)
       || labelFullText.match(/(\d+(?:\.\d+)?\s*%).*late\s*picks?/i);
     if (inlineMatch) {
@@ -562,6 +607,25 @@ async def _wait_for_quiet_period(tracker: dict[str, Any], max_wait_seconds: floa
             return
 
 
+async def _wait_for_late_value_after_quiet(
+    page,
+    tracker: dict[str, Any],
+    grace_seconds: float,
+):
+    deadline = time.monotonic() + grace_seconds
+    last_response_seen = tracker.get("response_count", 0)
+    while time.monotonic() < deadline:
+        snapshot = await page.evaluate("window.__latePicksProbeSnapshot()")
+        normalized_value = _normalize_percentage_string((snapshot or {}).get("valueText"))
+        if normalized_value:
+            return snapshot
+        if tracker.get("response_count", 0) > last_response_seen:
+            last_response_seen = tracker["response_count"]
+            deadline = time.monotonic() + grace_seconds
+        await asyncio.sleep(0.25)
+    return await page.evaluate("window.__latePicksProbeSnapshot()")
+
+
 async def _capture_container_html(page, container_path: str | None) -> str | None:
     if not container_path:
         return None
@@ -759,6 +823,7 @@ async def run_probe(args: argparse.Namespace):
             refresh_clicked_at_ms = int(time.time() * 1000)
 
             await _wait_for_quiet_period(tracker, args.max_wait_seconds, args.quiet_seconds)
+            await _wait_for_late_value_after_quiet(page, tracker, DEFAULT_POST_QUIET_GRACE_SECONDS)
             if response_tasks:
                 await asyncio.gather(*response_tasks)
 
