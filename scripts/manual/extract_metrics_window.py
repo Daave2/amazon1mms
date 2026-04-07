@@ -13,9 +13,9 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import sys
 import time
-from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.config import load_settings  # noqa: E402
+from core.logger import app_logger, configure_logging  # noqa: E402
 from core.metrics import build_form_data, normalize_metrics_payload  # noqa: E402
 from core.state import CacheManager, ScraperState  # noqa: E402
 from core.store_loader import load_stores_from_csv  # noqa: E402
@@ -135,6 +136,8 @@ def _select_stores(store_rows: list[dict[str, str]], store_filter: str, cache: C
 
 async def run_extraction(args: argparse.Namespace):
     settings = load_settings()
+    ensure_directory(settings.output_dir)
+    configure_logging(settings)
     storage_state_path = Path(settings.storage_state_path)
     if not storage_state_path.exists():
         raise FileNotFoundError(
@@ -156,12 +159,28 @@ async def run_extraction(args: argparse.Namespace):
     run_dir = REPO_ROOT / settings.output_dir / "extracts" / f"metrics_window_{resolved_window_name}_{timestamp}"
     responses_dir = run_dir / "responses"
     ensure_directory(str(responses_dir))
+    app_logger.info("Manual extract starting.")
+    app_logger.info(
+        "Window resolved to %s -> %s (%s).",
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+        resolved_window_name,
+    )
+    if args.stores.strip():
+        app_logger.info("Store filter requested: %s", args.stores)
+    else:
+        app_logger.info("No store filter provided. Extracting all configured stores with merchant ids.")
+    app_logger.info("Discovery cache template available: %s", bool(cache.api_url_template))
+    app_logger.info("%s stores selected for extraction.", len(selected_stores))
+    app_logger.info("Artifacts will be written to %s", run_dir)
 
     state = ScraperState(settings=settings)
     browser = None
     context = None
     page = None
     results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    started_at = time.monotonic()
 
     try:
         async with async_playwright() as playwright:
@@ -173,71 +192,89 @@ async def run_extraction(args: argparse.Namespace):
             login_visible = await page.locator("input#ap_email, input#ap_password, input[name='email']").first.is_visible()
             if login_visible:
                 raise RuntimeError("Saved auth state is not valid for manual extraction.")
+            app_logger.info("Saved auth state is valid for manual extraction.")
 
             request_client = context.request
-            for store in selected_stores:
+            for index, store in enumerate(selected_stores, start=1):
                 store_name = store["store_name"]
                 merchant_id = store["merchant_id"]
-                summary_url = _build_fast_path_target_url(
-                    cache.api_url_template,
-                    merchant_id,
-                    settings,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                )
-                detail_url = _build_fast_path_target_url(
-                    cache.api_url_template,
-                    merchant_id,
-                    settings,
-                    detail=True,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                )
+                app_logger.info("[%s/%s] Starting extraction for %s", index, len(selected_stores), store_name)
+                try:
+                    summary_url = _build_fast_path_target_url(
+                        cache.api_url_template,
+                        merchant_id,
+                        settings,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                    )
+                    detail_url = _build_fast_path_target_url(
+                        cache.api_url_template,
+                        merchant_id,
+                        settings,
+                        detail=True,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                    )
 
-                summary_payload, detail_payload = await fetch_metrics_pair_fast_path(
-                    request_client,
-                    summary_url,
-                    detail_url,
-                    store_name,
-                    state,
-                    45_000,
-                )
+                    summary_payload, detail_payload = await fetch_metrics_pair_fast_path(
+                        request_client,
+                        summary_url,
+                        detail_url,
+                        store_name,
+                        state,
+                        45_000,
+                    )
 
-                summary_path = responses_dir / f"{store_name.lower().replace(' ', '_').replace('/', '_')}_summary.json"
-                detail_path = responses_dir / f"{store_name.lower().replace(' ', '_').replace('/', '_')}_detail.json"
-                summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-                detail_path.write_text(json.dumps(detail_payload, indent=2), encoding="utf-8")
+                    safe_store_slug = store_name.lower().replace(" ", "_").replace("/", "_")
+                    summary_path = responses_dir / f"{safe_store_slug}_summary.json"
+                    detail_path = responses_dir / f"{safe_store_slug}_detail.json"
+                    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+                    detail_path.write_text(json.dumps(detail_payload, indent=2), encoding="utf-8")
 
-                normalized_summary = normalize_metrics_payload(summary_payload)
-                normalized_detail = normalize_metrics_payload(detail_payload)
-                combined = dict(normalized_summary)
-                combined["LatePicksRate"] = normalized_detail.get("LatePicksRate", 0.0)
-                combined["OrderCancellations"] = normalized_detail.get("OrderCancellations", 0.0)
-                display_metrics = build_form_data(
-                    store_name,
-                    combined,
-                    current_dt=end_dt,
-                    local_timezone=settings.local_timezone,
-                )
+                    normalized_summary = normalize_metrics_payload(summary_payload)
+                    normalized_detail = normalize_metrics_payload(detail_payload)
+                    combined = dict(normalized_summary)
+                    combined["LatePicksRate"] = normalized_detail.get("LatePicksRate", 0.0)
+                    combined["OrderCancellations"] = normalized_detail.get("OrderCancellations", 0.0)
+                    display_metrics = build_form_data(
+                        store_name,
+                        combined,
+                        current_dt=end_dt,
+                        local_timezone=settings.local_timezone,
+                    )
 
-                results.append(
-                    {
-                        "store": store_name,
-                        "dropdownName": store.get("dropdown_name", ""),
-                        "merchantId": merchant_id,
-                        "windowName": resolved_window_name,
-                        "windowStart": start_dt.isoformat(),
-                        "windowEnd": end_dt.isoformat(),
-                        "summaryUrl": summary_url,
-                        "detailUrl": detail_url,
-                        "summaryPath": str(summary_path),
-                        "detailPath": str(detail_path),
-                        "normalizedSummary": normalized_summary,
-                        "normalizedDetail": normalized_detail,
-                        "normalizedCombined": combined,
-                        "displayMetrics": display_metrics,
-                    }
-                )
+                    results.append(
+                        {
+                            "store": store_name,
+                            "dropdownName": store.get("dropdown_name", ""),
+                            "merchantId": merchant_id,
+                            "windowName": resolved_window_name,
+                            "windowStart": start_dt.isoformat(),
+                            "windowEnd": end_dt.isoformat(),
+                            "summaryUrl": summary_url,
+                            "detailUrl": detail_url,
+                            "summaryPath": str(summary_path),
+                            "detailPath": str(detail_path),
+                            "normalizedSummary": normalized_summary,
+                            "normalizedDetail": normalized_detail,
+                            "normalizedCombined": combined,
+                            "displayMetrics": display_metrics,
+                        }
+                    )
+                    app_logger.info(
+                        "[%s/%s] Finished %s: orders=%s units=%s lates=%s inf=%s cancelled=%s",
+                        index,
+                        len(selected_stores),
+                        store_name,
+                        display_metrics["orders"],
+                        display_metrics["units"],
+                        display_metrics["lates"],
+                        display_metrics["inf"],
+                        display_metrics["cancelled"],
+                    )
+                except Exception as exc:
+                    failures.append({"store": store_name, "error": str(exc)})
+                    app_logger.exception("[%s/%s] Extraction failed for %s: %s", index, len(selected_stores), store_name, exc)
     finally:
         await safe_close(page, "Manual extraction page")
         await safe_close(context, "Manual extraction context")
@@ -248,6 +285,8 @@ async def run_extraction(args: argparse.Namespace):
         "windowStart": start_dt.isoformat(),
         "windowEnd": end_dt.isoformat(),
         "storeCount": len(results),
+        "failureCount": len(failures),
+        "failures": failures,
         "stores": results,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
@@ -288,6 +327,27 @@ async def run_extraction(args: argparse.Namespace):
                     "time_available": display["time_available"],
                 }
             )
+
+    elapsed_seconds = time.monotonic() - started_at
+    app_logger.info(
+        "Manual extract complete in %.2fs. Success=%s Failure=%s Output=%s",
+        elapsed_seconds,
+        len(results),
+        len(failures),
+        run_dir,
+    )
+
+    summary_lines = [
+        "## Manual Extract Summary",
+        "",
+        f"- Window: `{start_dt.isoformat()} -> {end_dt.isoformat()}`",
+        f"- Success: `{len(results)}`",
+        f"- Failure: `{len(failures)}`",
+        f"- Output: `{run_dir}`",
+    ]
+    github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if github_step_summary:
+        Path(github_step_summary).write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
     print(f"Output: {run_dir}")
     print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()}")
