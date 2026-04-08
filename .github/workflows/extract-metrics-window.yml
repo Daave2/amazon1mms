@@ -29,13 +29,29 @@ on:
         required: false
         default: ""
         type: string
+      focus_store:
+        description: Store to highlight against the full network export
+        required: false
+        default: Morrisons Thornton Cleveleys
+        type: string
+  schedule:
+    - cron: "0 10 * * *"
+    - cron: "0 11 * * *"
+    - cron: "0 13 * * *"
+    - cron: "0 14 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 17 * * *"
+    - cron: "30 18 * * *"
+    - cron: "30 19 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: "3.11"
+  UK_TARGET_TIMES: "11:00 14:00 17:00 19:30"
+  DEFAULT_FOCUS_STORE: "Morrisons Thornton Cleveleys"
   LOGIN_URL: ${{ secrets.LOGIN_URL }}
   LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
   LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
@@ -45,7 +61,57 @@ env:
   CHAT_WEBHOOK_URL: ${{ secrets.CHAT_WEBHOOK_URL }}
 
 jobs:
+  check-time:
+    runs-on: ubuntu-latest
+    outputs:
+      run_job: ${{ steps.check_time.outputs.run_job }}
+      current_uk_time: ${{ steps.check_time.outputs.current_uk_time }}
+      gate_reason: ${{ steps.check_time.outputs.gate_reason }}
+
+    steps:
+      - name: Check current UK time against target slots
+        id: check_time
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "current_uk_time=manual" >> $GITHUB_OUTPUT
+            echo "gate_reason=manual_dispatch" >> $GITHUB_OUTPUT
+            {
+              echo "## Run Gate"
+              echo ""
+              echo "- Trigger: \`workflow_dispatch\`"
+              echo "- Decision: run extractor"
+            } >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          CURRENT_UK_TIME=$(TZ="Europe/London" date +'%H:%M')
+          echo "Current UK time is: ${CURRENT_UK_TIME}"
+          echo "Target times are: ${{ env.UK_TARGET_TIMES }}"
+          echo "current_uk_time=${CURRENT_UK_TIME}" >> $GITHUB_OUTPUT
+
+          if [[ " ${{ env.UK_TARGET_TIMES }} " =~ " ${CURRENT_UK_TIME} " ]]; then
+            echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_window_match" >> $GITHUB_OUTPUT
+            DECISION="run extractor"
+          else
+            echo "run_job=false" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_window_skip" >> $GITHUB_OUTPUT
+            DECISION="skip extractor"
+          fi
+
+          {
+            echo "## Run Gate"
+            echo ""
+            echo "- Trigger: \`schedule\`"
+            echo "- Current London time: \`${CURRENT_UK_TIME}\`"
+            echo "- Allowed times: \`${{ env.UK_TARGET_TIMES }}\`"
+            echo "- Decision: ${DECISION}"
+          } >> $GITHUB_STEP_SUMMARY
+
   extract:
+    needs: check-time
+    if: needs.check-time.outputs.run_job == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -133,17 +199,24 @@ jobs:
           PY
 
       - name: Run metrics window extractor
+        env:
+          INPUT_STORES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.stores || '' }}
+          INPUT_WINDOW_PRESET: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.window_preset || 'today' }}
+          INPUT_CUSTOM_START: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.custom_start || '' }}
+          INPUT_CUSTOM_END: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.custom_end || '' }}
+          INPUT_FOCUS_STORE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.focus_store || env.DEFAULT_FOCUS_STORE }}
         run: |
           extra_args=()
-          if [ -n "${{ github.event.inputs.stores }}" ]; then
-            extra_args+=(--stores "${{ github.event.inputs.stores }}")
+          if [ -n "${INPUT_STORES}" ]; then
+            extra_args+=(--stores "${INPUT_STORES}")
           fi
-          if [ "${{ github.event.inputs.window_preset }}" = "custom" ]; then
-            extra_args+=(--start "${{ github.event.inputs.custom_start }}" --end "${{ github.event.inputs.custom_end }}")
+          if [ "${INPUT_WINDOW_PRESET}" = "custom" ]; then
+            extra_args+=(--start "${INPUT_CUSTOM_START}" --end "${INPUT_CUSTOM_END}")
           fi
 
           python scripts/manual/extract_metrics_window.py \
-            --window-preset "${{ github.event.inputs.window_preset }}" \
+            --window-preset "${INPUT_WINDOW_PRESET}" \
+            --focus-store "${INPUT_FOCUS_STORE}" \
             "${extra_args[@]}"
 
       - name: Upload extraction artifacts
@@ -159,6 +232,9 @@ jobs:
 
       - name: Write extraction summary
         if: always()
+        env:
+          GATE_CURRENT_UK_TIME: ${{ needs.check-time.outputs.current_uk_time }}
+          GATE_REASON: ${{ needs.check-time.outputs.gate_reason }}
         run: |
           python - <<'PY'
           import json
@@ -167,10 +243,16 @@ jobs:
 
           from core.reporting import build_github_step_summary_markdown
 
+          gate_reason = os.getenv("GATE_REASON", "")
+          gate_time = os.getenv("GATE_CURRENT_UK_TIME", "")
           summary_path = Path("output/run_summary.json")
           if summary_path.exists():
               summary = json.loads(summary_path.read_text(encoding="utf-8"))
-              markdown = build_github_step_summary_markdown(summary)
+              markdown = build_github_step_summary_markdown(
+                  summary,
+                  gate_reason=gate_reason,
+                  gate_hour=gate_time,
+              )
           else:
               markdown = "\n".join(
                   [
@@ -180,6 +262,10 @@ jobs:
                       "",
                   ]
               )
+
+          focus_summary_path = Path("output/focus_store_summary.md")
+          if focus_summary_path.exists():
+              markdown += "\n" + focus_summary_path.read_text(encoding="utf-8")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
               handle.write(markdown)

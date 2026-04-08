@@ -43,6 +43,7 @@ from services.metrics_service import (  # noqa: E402
 
 
 WINDOW_PRESETS = {"today", "yesterday", "this_week", "last_7_days", "custom"}
+DEFAULT_FOCUS_STORE = "Morrisons Thornton Cleveleys"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -67,6 +68,11 @@ def _parse_args() -> argparse.Namespace:
         "--end",
         default="",
         help="Custom end in local time. Accepted formats: YYYY-MM-DD HH or YYYY-MM-DDTHH.",
+    )
+    parser.add_argument(
+        "--focus-store",
+        default=DEFAULT_FOCUS_STORE,
+        help="Store to highlight in the comparison summary while still extracting all stores.",
     )
     return parser.parse_args()
 
@@ -141,6 +147,252 @@ def _store_slug(store_name: str) -> str:
     return store_name.lower().replace(" ", "_").replace("/", "_")
 
 
+def _normalize_store_label(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _format_signed_delta(value: float, decimals: int = 1, suffix: str = "") -> str:
+    return f"{value:+.{decimals}f}{suffix}"
+
+
+def _format_share(part: float, whole: float) -> str:
+    return f"{_safe_divide(part, whole) * 100:.1f}%"
+
+
+def _aggregate_normalized_metrics(metric_rows: list[dict[str, float]]) -> dict[str, float]:
+    total_orders = sum(float(row.get("OrdersShopped_V2") or 0.0) for row in metric_rows)
+    total_units = sum(float(row.get("RequestedQuantity_V2") or 0.0) for row in metric_rows)
+    total_fulfilled = sum(float(row.get("PickedUnits_V2") or 0.0) for row in metric_rows)
+    total_time_available = sum(float(row.get("TimeAvailable_V2") or 0.0) for row in metric_rows)
+    total_cancellations = sum(float(row.get("OrderCancellations") or 0.0) for row in metric_rows)
+    total_late_orders = sum(
+        float(row.get("OrdersShopped_V2") or 0.0) * (float(row.get("LatePicksRate") or 0.0) / 100.0)
+        for row in metric_rows
+    )
+    total_inf_units = sum(
+        float(row.get("RequestedQuantity_V2") or 0.0) * (float(row.get("ItemNotFoundRate_V2") or 0.0) / 100.0)
+        for row in metric_rows
+    )
+
+    total_pick_hours = 0.0
+    for row in metric_rows:
+        picked_units = float(row.get("PickedUnits_V2") or 0.0)
+        uph = float(row.get("AverageUPH_V2") or 0.0)
+        if picked_units > 0 and uph > 0:
+            total_pick_hours += picked_units / uph
+
+    inf_rate = _safe_divide(total_inf_units, total_units) * 100.0
+
+    return {
+        "OrdersShopped_V2": total_orders,
+        "RequestedQuantity_V2": total_units,
+        "PickedUnits_V2": total_fulfilled,
+        "AverageUPH_V2": _safe_divide(total_fulfilled, total_pick_hours),
+        "LatePicksRate": _safe_divide(total_late_orders, total_orders) * 100.0,
+        "ItemNotFoundRate_V2": inf_rate,
+        "ItemFoundRate_V2": 100.0 - inf_rate if total_units > 0 else 0.0,
+        "OrderCancellations": total_cancellations,
+        "TimeAvailable_V2": total_time_available,
+    }
+
+
+def _find_focus_store_result(results: list[dict[str, Any]], focus_store: str) -> dict[str, Any] | None:
+    requested = _normalize_store_label(focus_store)
+    exact_match = None
+    partial_match = None
+
+    for result in results:
+        candidates = {
+            _normalize_store_label(result.get("store", "")),
+            _normalize_store_label(result.get("dropdownName", "")),
+        }
+        if requested in candidates:
+            exact_match = result
+            break
+        if requested and any(requested in candidate for candidate in candidates if candidate):
+            partial_match = result
+
+    return exact_match or partial_match
+
+
+def _compute_rankings(results: list[dict[str, Any]], focus_store_name: str) -> dict[str, dict[str, Any]]:
+    focus_store_key = _normalize_store_label(focus_store_name)
+    ranking_specs = [
+        ("orders", "OrdersShopped_V2", True, "Higher is better"),
+        ("units", "RequestedQuantity_V2", True, "Higher is better"),
+        ("uph", "AverageUPH_V2", True, "Higher is better"),
+        ("inf", "ItemNotFoundRate_V2", False, "Lower is better"),
+        ("found", "ItemFoundRate_V2", True, "Higher is better"),
+        ("cancelled", "OrderCancellations", False, "Lower is better"),
+        ("lates", "LatePicksRate", False, "Lower is better"),
+    ]
+
+    rankings: dict[str, dict[str, Any]] = {}
+    for label, metric_key, higher_is_better, guidance in ranking_specs:
+        if higher_is_better:
+            ordered = sorted(
+                results,
+                key=lambda item: (
+                    -(float(item["normalizedCombined"].get(metric_key) or 0.0)),
+                    item["store"].lower(),
+                ),
+            )
+        else:
+            ordered = sorted(
+                results,
+                key=lambda item: (
+                    float(item["normalizedCombined"].get(metric_key) or 0.0),
+                    item["store"].lower(),
+                ),
+            )
+
+        for index, result in enumerate(ordered, start=1):
+            if _normalize_store_label(result["store"]) == focus_store_key:
+                rankings[label] = {
+                    "position": index,
+                    "total": len(ordered),
+                    "guidance": guidance,
+                }
+                break
+
+    return rankings
+
+
+def _build_focus_store_summary(
+    results: list[dict[str, Any]],
+    focus_store: str,
+    window_name: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    timezone,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "requestedFocusStore": focus_store,
+        "focusStoreFound": False,
+        "storeCount": len(results),
+        "windowName": window_name,
+        "windowStart": start_dt.isoformat(),
+        "windowEnd": end_dt.isoformat(),
+        "allStoresIncluded": True,
+        "allStoresCsv": "summary.csv",
+    }
+
+    if not results:
+        return summary
+
+    network_metrics = _aggregate_normalized_metrics([result["normalizedCombined"] for result in results])
+    network_display = build_form_data("Network", network_metrics, current_dt=end_dt, local_timezone=timezone)
+    summary["networkMetrics"] = network_metrics
+    summary["networkDisplay"] = network_display
+
+    focus_result = _find_focus_store_result(results, focus_store)
+    if focus_result is None:
+        summary["availableStores"] = [result["store"] for result in results]
+        return summary
+
+    peer_results = [result for result in results if result["store"] != focus_result["store"]]
+    peer_metrics = _aggregate_normalized_metrics([result["normalizedCombined"] for result in peer_results])
+    peer_display = build_form_data("Peer Network", peer_metrics, current_dt=end_dt, local_timezone=timezone)
+    focus_metrics = focus_result["normalizedCombined"]
+    focus_display = focus_result["displayMetrics"]
+
+    summary["focusStoreFound"] = True
+    summary["matchedStore"] = focus_result["store"]
+    summary["matchedDropdownName"] = focus_result.get("dropdownName", "")
+    summary["focusMetrics"] = focus_metrics
+    summary["focusDisplay"] = focus_display
+    summary["peerNetworkMetrics"] = peer_metrics
+    summary["peerNetworkDisplay"] = peer_display
+    summary["shares"] = {
+        "ordersPct": _safe_divide(float(focus_metrics.get("OrdersShopped_V2") or 0.0), float(network_metrics.get("OrdersShopped_V2") or 0.0))
+        * 100.0,
+        "unitsPct": _safe_divide(float(focus_metrics.get("RequestedQuantity_V2") or 0.0), float(network_metrics.get("RequestedQuantity_V2") or 0.0))
+        * 100.0,
+        "fulfilledPct": _safe_divide(float(focus_metrics.get("PickedUnits_V2") or 0.0), float(network_metrics.get("PickedUnits_V2") or 0.0))
+        * 100.0,
+        "cancelledPct": _safe_divide(
+            float(focus_metrics.get("OrderCancellations") or 0.0),
+            float(network_metrics.get("OrderCancellations") or 0.0),
+        )
+        * 100.0,
+    }
+    summary["deltas"] = {
+        "uph": float(focus_metrics.get("AverageUPH_V2") or 0.0) - float(network_metrics.get("AverageUPH_V2") or 0.0),
+        "inf": float(focus_metrics.get("ItemNotFoundRate_V2") or 0.0)
+        - float(network_metrics.get("ItemNotFoundRate_V2") or 0.0),
+        "found": float(focus_metrics.get("ItemFoundRate_V2") or 0.0)
+        - float(network_metrics.get("ItemFoundRate_V2") or 0.0),
+        "lates": float(focus_metrics.get("LatePicksRate") or 0.0) - float(network_metrics.get("LatePicksRate") or 0.0),
+    }
+    summary["rankings"] = _compute_rankings(results, focus_result["store"])
+
+    return summary
+
+
+def _build_focus_store_markdown(summary: dict[str, Any]) -> str:
+    lines = ["## Focus Store Comparison", ""]
+    lines.append(f"- Focus store requested: `{summary['requestedFocusStore']}`")
+    lines.append(f"- Window: `{summary['windowStart']}` -> `{summary['windowEnd']}`")
+    lines.append(f"- All stores included: `{summary['storeCount']}`")
+    lines.append(f"- Full network export: `{summary['allStoresCsv']}`")
+
+    if not summary.get("focusStoreFound"):
+        lines.append("- Requested focus store was not present in this extract.")
+        return "\n".join(lines) + "\n"
+
+    focus_display = summary["focusDisplay"]
+    network_display = summary["networkDisplay"]
+    shares = summary["shares"]
+    deltas = summary["deltas"]
+    rankings = summary["rankings"]
+
+    lines.extend(
+        [
+            "",
+            f"### {summary['matchedStore']}",
+            "",
+            "| Metric | Focus Store | Network |",
+            "| --- | ---: | ---: |",
+            f"| Orders | {focus_display['orders']} | {network_display['orders']} |",
+            f"| Units Requested | {focus_display['units']} | {network_display['units']} |",
+            f"| Units Fulfilled | {focus_display['fulfilled']} | {network_display['fulfilled']} |",
+            f"| UPH | {focus_display['uph']} | {network_display['uph']} |",
+            f"| INF | {focus_display['inf']} | {network_display['inf']} |",
+            f"| Item Found Rate | {focus_display['found']} | {network_display['found']} |",
+            f"| Order cancellations | {focus_display['cancelled']} | {network_display['cancelled']} |",
+            f"| Late Picks | {focus_display['lates']} | {network_display['lates']} |",
+            "",
+            "### Store vs Network",
+            "",
+            f"- Orders share of network: `{_format_share(float(summary['focusMetrics'].get('OrdersShopped_V2') or 0.0), float(summary['networkMetrics'].get('OrdersShopped_V2') or 0.0))}`",
+            f"- Units share of network: `{_format_share(float(summary['focusMetrics'].get('RequestedQuantity_V2') or 0.0), float(summary['networkMetrics'].get('RequestedQuantity_V2') or 0.0))}`",
+            f"- Fulfilled units share of network: `{_format_share(float(summary['focusMetrics'].get('PickedUnits_V2') or 0.0), float(summary['networkMetrics'].get('PickedUnits_V2') or 0.0))}`",
+            f"- UPH vs network: `{_format_signed_delta(deltas['uph'], decimals=0)}`",
+            f"- INF vs network: `{_format_signed_delta(deltas['inf'], suffix=' pp')}`",
+            f"- Item found vs network: `{_format_signed_delta(deltas['found'], suffix=' pp')}`",
+            f"- Late Picks vs network: `{_format_signed_delta(deltas['lates'], suffix=' pp')}`",
+            f"- Order cancellations share of network: `{shares['cancelledPct']:.1f}%`",
+            "",
+            "### Network Ranking",
+            "",
+            f"- Orders rank: `{rankings['orders']['position']}/{rankings['orders']['total']}`",
+            f"- Units rank: `{rankings['units']['position']}/{rankings['units']['total']}`",
+            f"- UPH rank: `{rankings['uph']['position']}/{rankings['uph']['total']}` ({rankings['uph']['guidance']})",
+            f"- INF rank: `{rankings['inf']['position']}/{rankings['inf']['total']}` ({rankings['inf']['guidance']})",
+            f"- Item found rank: `{rankings['found']['position']}/{rankings['found']['total']}` ({rankings['found']['guidance']})",
+            f"- Order cancellations rank: `{rankings['cancelled']['position']}/{rankings['cancelled']['total']}` ({rankings['cancelled']['guidance']})",
+            f"- Late Picks rank: `{rankings['lates']['position']}/{rankings['lates']['total']}` ({rankings['lates']['guidance']})",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
 class ExtractSubmissionManager(SubmissionManager):
     async def record_extracted_submission(self, form_data: dict[str, str]) -> SubmissionTask:
         task = SubmissionTask(
@@ -192,6 +444,7 @@ async def run_extraction(args: argparse.Namespace):
         app_logger.info("Store filter requested: %s", args.stores)
     else:
         app_logger.info("No store filter provided. Extracting all configured stores with merchant ids.")
+    app_logger.info("Focus store for comparison output: %s", args.focus_store)
     app_logger.info("Discovery cache template available: %s", bool(cache.api_url_template))
     app_logger.info("%s stores selected for extraction.", len(selected_stores))
     app_logger.info("Artifacts will be written to %s", run_dir)
@@ -330,16 +583,39 @@ async def run_extraction(args: argparse.Namespace):
         await safe_close(context, "Manual extraction context")
         await safe_close(browser, "Manual extraction browser")
 
+    results.sort(key=lambda item: item["store"].lower())
+    failures.sort(key=lambda item: item["store"].lower())
+
+    focus_summary_payload = _build_focus_store_summary(
+        results,
+        args.focus_store,
+        resolved_window_name,
+        start_dt,
+        end_dt,
+        settings.local_timezone,
+    )
+    focus_summary_markdown = _build_focus_store_markdown(focus_summary_payload)
+
     summary_payload = {
         "windowName": resolved_window_name,
         "windowStart": start_dt.isoformat(),
         "windowEnd": end_dt.isoformat(),
         "storeCount": len(results),
         "failureCount": len(failures),
+        "requestedFocusStore": args.focus_store,
+        "focusStoreFound": focus_summary_payload.get("focusStoreFound", False),
         "failures": failures,
+        "focusStoreSummary": focus_summary_payload,
         "stores": results,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    (run_dir / "focus_store_summary.json").write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
+    (run_dir / "focus_store_summary.md").write_text(focus_summary_markdown, encoding="utf-8")
+
+    stable_focus_json = REPO_ROOT / settings.output_dir / "focus_store_summary.json"
+    stable_focus_markdown = REPO_ROOT / settings.output_dir / "focus_store_summary.md"
+    stable_focus_json.write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
+    stable_focus_markdown.write_text(focus_summary_markdown, encoding="utf-8")
 
     csv_path = run_dir / "summary.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -394,6 +670,14 @@ async def run_extraction(args: argparse.Namespace):
         len(failures),
         run_dir,
     )
+    if focus_summary_payload.get("focusStoreFound"):
+        app_logger.info(
+            "Focus store summary ready for %s against %s stores.",
+            focus_summary_payload.get("matchedStore"),
+            focus_summary_payload.get("storeCount"),
+        )
+    else:
+        app_logger.warning("Focus store %s was not found in the extracted store set.", args.focus_store)
 
     print(f"Output: {run_dir}")
     print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()}")

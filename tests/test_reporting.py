@@ -270,6 +270,28 @@ def test_build_github_step_summary_markdown_includes_dropdown_and_failure_digest
     assert "- Submission: 2 event(s), 2 terminal, 2 affected source(s); top reason: HTTP Submit Fail 500" in markdown
 
 
+def test_build_github_step_summary_markdown_uses_time_label_for_hhmm_gate():
+    markdown = reporting.build_github_step_summary_markdown(
+        {
+            "status": "completed",
+            "status_detail": "ok",
+            "trigger": "schedule",
+            "elapsed_seconds": 12.3,
+            "stores": {"successful_submissions": 1, "total": 1, "failed": 0},
+            "retries": {"total": 0, "stores": 0},
+            "auth": {"state": "reused"},
+            "discovery": {},
+            "collection_metrics": {},
+            "failure_digest": [],
+            "failure_summary": {"recent_failures": []},
+        },
+        gate_reason="scheduled_window_match",
+        gate_hour="19:30",
+    )
+
+    assert "- Current London time: `19:30`" in markdown
+
+
 def _build_state(status: str, detail: str) -> ScraperState:
     state = ScraperState()
     state.run_started_at = datetime(2026, 4, 2, 9, 0, tzinfo=LONDON)

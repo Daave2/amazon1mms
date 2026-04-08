@@ -206,7 +206,8 @@ def build_github_step_summary_markdown(summary: Mapping[str, object], gate_reaso
     if gate_reason:
         lines.extend(["### Gate", "", f"- Gate reason: `{gate_reason}`"])
         if gate_hour and gate_hour != "manual":
-            lines.append(f"- Current London hour: `{gate_hour}`")
+            gate_label = "Current London time" if ":" in gate_hour else "Current London hour"
+            lines.append(f"- {gate_label}: `{gate_hour}`")
         lines.append("")
 
     stores = summary.get("stores", {})
