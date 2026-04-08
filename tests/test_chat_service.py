@@ -82,6 +82,50 @@ def test_build_batch_chat_payload_limits_outliers_to_worst_three():
     assert len(table_items) == 32
 
 
+def test_build_batch_chat_payload_can_focus_on_named_store_against_network():
+    state = ScraperState()
+    state.chat_batch_count = 1
+    state.chat_focus_store = "Thornton Cleveleys"
+
+    payload = chat_service.build_batch_chat_payload(
+        [
+            {
+                "store": "Morrisons Thornton Cleveleys",
+                "orders": "120",
+                "units": "3000",
+                "uph": "82",
+                "lates": "1.4 %",
+                "inf": "2.0 %",
+            },
+            {
+                "store": "Morrisons York",
+                "orders": "180",
+                "units": "4200",
+                "uph": "78",
+                "lates": "3.2 %",
+                "inf": "2.4 %",
+            },
+        ],
+        state,
+    )
+
+    summary_card = payload["cardsV2"][0]["card"]
+    table_card = payload["cardsV2"][1]["card"]
+    assert summary_card["header"]["subtitle"].endswith("Thornton Cleveleys vs network")
+    assert [section["header"] for section in summary_card["sections"]] == [
+        "Focus Store",
+        "Network Comparison",
+        "Store vs Network",
+        "Network Outliers",
+    ]
+    comparison_text = summary_card["sections"][2]["widgets"][0]["textParagraph"]["text"]
+    table_items = table_card["sections"][0]["widgets"][0]["grid"]["items"]
+    assert "Thornton Cleveleys processed 120 orders and 3000 units" in comparison_text
+    assert "UPH rank: 1/2" in comparison_text
+    assert "Lates rank: 1/2" in comparison_text
+    assert table_items[4]["title"] == "Thornton Cleveleys (Focus)"
+
+
 def test_build_job_summary_payload_includes_run_context_and_issues():
     state = ScraperState()
     state.run_started_at = datetime(2026, 4, 2, 12, 0, tzinfo=LONDON)
@@ -170,6 +214,31 @@ def test_build_job_summary_payload_includes_run_context_and_issues():
     assert "Morrisons Chippenham (HTTP Submit Fail 500)" in (
         card["sections"][6]["widgets"][0]["textParagraph"]["text"]
     )
+
+
+def test_build_job_summary_payload_includes_focus_store_section_when_present():
+    state = ScraperState()
+    state.run_started_at = datetime(2026, 4, 2, 12, 0, tzinfo=LONDON)
+    state.run_finished_at = datetime(2026, 4, 2, 12, 1, tzinfo=LONDON)
+    state.set_job_status("completed", "Run completed successfully")
+    state.progress["total"] = 2
+    state.progress["current"] = 2
+    state.focus_store_summary = {
+        "focusStoreFound": True,
+        "matchedStore": "Morrisons Thornton Cleveleys",
+        "focusDisplay": {"uph": "82", "lates": "1.4 %", "inf": "2.0 %"},
+        "networkDisplay": {"uph": "80", "lates": "2.3 %", "inf": "2.6 %"},
+    }
+
+    payload = chat_service.build_job_summary_payload(state, duration=60.0)
+
+    card = payload["cardsV2"][0]["card"]
+    section_headers = [section["header"] for section in card["sections"]]
+    assert "Focus Store" in section_headers
+    focus_section = next(section for section in card["sections"] if section["header"] == "Focus Store")
+    assert focus_section["widgets"][0]["decoratedText"]["text"] == "Thornton Cleveleys"
+    assert focus_section["widgets"][1]["decoratedText"]["text"] == "82 / 80"
+    assert focus_section["widgets"][2]["decoratedText"]["text"] == "1.4 % / 2.3 %"
 
 
 def test_build_job_summary_payload_shows_fatal_error_section():

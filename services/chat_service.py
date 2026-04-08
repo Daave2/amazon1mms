@@ -89,6 +89,236 @@ def _collect_metric_rows(entries: list[dict[str, str]], field: str) -> list[dict
     return metric_rows
 
 
+def _normalize_store_label(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _find_focus_entry(entries: list[dict[str, str]], focus_store: str) -> dict[str, str] | None:
+    requested = _normalize_store_label(focus_store)
+    exact_match = None
+    partial_match = None
+
+    for entry in entries:
+        normalized_store = _normalize_store_label(entry.get("store", ""))
+        if normalized_store == requested:
+            exact_match = entry
+            break
+        if requested and requested in normalized_store:
+            partial_match = entry
+
+    return exact_match or partial_match
+
+
+def _format_delta_text(metric_name: str, focus_value: float, network_value: float, higher_is_better: bool) -> str:
+    delta = focus_value - network_value
+    if abs(delta) < 0.05:
+        return f"{metric_name} is in line with network at {focus_value:.1f}."
+
+    if higher_is_better:
+        direction = "above" if delta > 0 else "below"
+    else:
+        direction = "better than" if delta < 0 else "worse than"
+
+    return (
+        f"{metric_name} is {abs(delta):.1f} {'pp' if metric_name != 'UPH' else ''} "
+        f"{direction} network ({focus_value:.1f} vs {network_value:.1f})."
+    ).replace("  ", " ").replace(" .", ".")
+
+
+def _build_rank_line(
+    entries: list[dict[str, str]],
+    focus_entry: dict[str, str],
+    field: str,
+    higher_is_better: bool,
+    label: str,
+) -> str:
+    metric_rows = _collect_metric_rows(entries, field)
+    focus_store = sanitize_store_name(focus_entry.get("store", "Unknown"))
+    if higher_is_better:
+        ordered = sorted(metric_rows, key=lambda row: (-float(row["value"]), str(row["store"])))
+    else:
+        ordered = sorted(metric_rows, key=lambda row: (float(row["value"]), str(row["store"])))
+
+    for index, row in enumerate(ordered, start=1):
+        if row["store"] == focus_store:
+            return f"{label} rank: {index}/{len(ordered)}"
+    return f"{label} rank: N/A"
+
+
+def _build_focus_batch_payload(
+    entries: list[dict[str, str]],
+    state: ScraperState,
+    settings: Settings,
+    focus_store: str,
+) -> dict[str, object]:
+    batch_header_text = datetime.now(settings.local_timezone).strftime("%A %d %B, %H:%M")
+    sorted_entries = sorted(entries, key=lambda entry: sanitize_store_name(entry.get("store", "")))
+    focus_entry = _find_focus_entry(sorted_entries, focus_store)
+    if not focus_entry:
+        return {}
+
+    focus_store_name = sanitize_store_name(focus_entry.get("store", focus_store))
+    uph_rows = _collect_metric_rows(sorted_entries, "uph")
+    lates_rows = _collect_metric_rows(sorted_entries, "lates")
+    inf_rows = _collect_metric_rows(sorted_entries, "inf")
+    orders_rows = _collect_metric_rows(sorted_entries, "orders")
+    units_rows = _collect_metric_rows(sorted_entries, "units")
+
+    focus_uph = _extract_numeric_value(focus_entry.get("uph")) or 0.0
+    focus_lates = _extract_numeric_value(focus_entry.get("lates")) or 0.0
+    focus_inf = _extract_numeric_value(focus_entry.get("inf")) or 0.0
+    focus_orders = _extract_numeric_value(focus_entry.get("orders")) or 0.0
+    focus_units = _extract_numeric_value(focus_entry.get("units")) or 0.0
+
+    network_uph = sum(float(row["value"]) for row in uph_rows) / len(uph_rows) if uph_rows else 0.0
+    network_lates = sum(float(row["value"]) for row in lates_rows) / len(lates_rows) if lates_rows else 0.0
+    network_inf = sum(float(row["value"]) for row in inf_rows) / len(inf_rows) if inf_rows else 0.0
+    network_orders = sum(float(row["value"]) for row in orders_rows)
+    network_units = sum(float(row["value"]) for row in units_rows)
+
+    comparison_lines = [
+        f"{focus_store_name} processed {int(focus_orders)} orders and {int(focus_units)} units, representing {(focus_orders / network_orders * 100 if network_orders else 0.0):.1f}% of network orders.",
+        _format_delta_text("UPH", focus_uph, network_uph, higher_is_better=True),
+        _format_delta_text("Lates", focus_lates, network_lates, higher_is_better=False),
+        _format_delta_text("INF", focus_inf, network_inf, higher_is_better=False),
+        _build_rank_line(sorted_entries, focus_entry, "uph", True, "UPH"),
+        _build_rank_line(sorted_entries, focus_entry, "lates", False, "Lates"),
+        _build_rank_line(sorted_entries, focus_entry, "inf", False, "INF"),
+    ]
+    outlier_lines = [
+        _format_ranked_metric_line("Lowest UPH", uph_rows, descending=False),
+        _format_ranked_metric_line("Highest Lates", lates_rows, descending=True, suffix="%", zero_is_all_clear=True),
+        _format_ranked_metric_line("Highest INF", inf_rows, descending=True, suffix="%", zero_is_all_clear=True),
+    ]
+
+    sections = [
+        {
+            "header": "Focus Store",
+            "widgets": [
+                {
+                    "decoratedText": {
+                        "topLabel": "Store",
+                        "text": focus_store_name,
+                        "startIcon": {"knownIcon": "STORE"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "UPH",
+                        "text": focus_entry.get("uph", "N/A"),
+                        "startIcon": {"knownIcon": "STAR"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Lates",
+                        "text": focus_entry.get("lates", "N/A"),
+                        "startIcon": {"knownIcon": "CLOCK"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "INF",
+                        "text": focus_entry.get("inf", "N/A"),
+                        "startIcon": {"knownIcon": "DESCRIPTION"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Orders",
+                        "text": focus_entry.get("orders", "N/A"),
+                        "startIcon": {"knownIcon": "SHOPPING_CART"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Units",
+                        "text": focus_entry.get("units", "N/A"),
+                        "startIcon": {"knownIcon": "TICKET"},
+                    }
+                },
+            ],
+        },
+        {
+            "header": "Network Comparison",
+            "widgets": [
+                {
+                    "decoratedText": {
+                        "topLabel": "Stores In Batch",
+                        "text": str(len(sorted_entries)),
+                        "startIcon": {"knownIcon": "STORE"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Network Avg UPH",
+                        "text": f"{network_uph:.1f}",
+                        "startIcon": {"knownIcon": "STAR"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Network Avg Lates",
+                        "text": f"{network_lates:.1f} %",
+                        "startIcon": {"knownIcon": "CLOCK"},
+                    }
+                },
+                {
+                    "decoratedText": {
+                        "topLabel": "Network Avg INF",
+                        "text": f"{network_inf:.1f} %",
+                        "startIcon": {"knownIcon": "DESCRIPTION"},
+                    }
+                },
+            ],
+        },
+        {
+            "header": "Store vs Network",
+            "widgets": [
+                {
+                    "textParagraph": {
+                        "text": _format_html_lines(comparison_lines),
+                    }
+                }
+            ],
+        },
+        {
+            "header": "Network Outliers",
+            "widgets": [
+                {
+                    "textParagraph": {
+                        "text": _format_html_lines(outlier_lines),
+                    }
+                }
+            ],
+        },
+    ]
+
+    return {
+        "cardsV2": [
+            {
+                "cardId": f"focus-summary-{state.chat_batch_count}",
+                "card": {
+                    "header": {
+                        "title": "1MMS KPI Batch",
+                        "subtitle": f"{batch_header_text} • Batch {state.chat_batch_count} • {focus_store_name} vs network",
+                        "imageUrl": CARD_IMAGE_URL,
+                        "imageType": "CIRCLE",
+                    },
+                    "sections": sections,
+                },
+            },
+            _build_batch_table_card(
+                sorted_entries,
+                batch_header_text,
+                state.chat_batch_count,
+                settings,
+                focus_store=focus_store_name,
+            ),
+        ]
+    }
+
+
 def _describe_target_position(value: float, threshold: float, higher_is_better: bool) -> str:
     if higher_is_better:
         delta = value - threshold
@@ -210,7 +440,13 @@ def _build_batch_table_card(
     batch_header_text: str,
     batch_number: int,
     settings: Settings,
+    focus_store: str = "",
 ) -> dict[str, object]:
+    focus_entry = _find_focus_entry(entries, focus_store) if focus_store else None
+    ordered_entries = list(entries)
+    if focus_entry:
+        ordered_entries = [focus_entry, *[entry for entry in entries if entry is not focus_entry]]
+
     grid_items = [
         {"title": "Store", "textAlignment": "START"},
         {"title": "UPH", "textAlignment": "CENTER"},
@@ -218,15 +454,18 @@ def _build_batch_table_card(
         {"title": "INF", "textAlignment": "CENTER"},
     ]
 
-    for entry in entries:
+    for entry in ordered_entries:
         uph_val = entry.get("uph", "N/A")
         lates_val = entry.get("lates", "0.0 %") or "0.0 %"
         inf_val = entry.get("inf", "0.0 %") or "0.0 %"
+        store_title = sanitize_store_name(entry.get("store", "N/A"))
+        if focus_entry is entry:
+            store_title = f"{store_title} (Focus)"
 
         grid_items.extend(
             [
                 {
-                    "title": sanitize_store_name(entry.get("store", "N/A")),
+                    "title": store_title,
                     "textAlignment": "START",
                 },
                 {
@@ -278,6 +517,12 @@ def build_batch_chat_payload(
     settings: Settings | None = None,
 ) -> dict[str, object]:
     settings = settings or getattr(state, "settings", None) or load_settings()
+    focus_store = str(getattr(state, "chat_focus_store", "") or "").strip()
+    if focus_store:
+        focused_payload = _build_focus_batch_payload(entries, state, settings, focus_store)
+        if focused_payload:
+            return focused_payload
+
     batch_header_text = datetime.now(settings.local_timezone).strftime("%A %d %B, %H:%M")
     card_subtitle = f"{batch_header_text} • Batch {state.chat_batch_count} • {len(entries)} stores"
 
@@ -386,7 +631,13 @@ def build_batch_chat_payload(
                     "sections": sections,
                 },
             },
-            _build_batch_table_card(sorted_entries, batch_header_text, state.chat_batch_count, settings),
+            _build_batch_table_card(
+                sorted_entries,
+                batch_header_text,
+                state.chat_batch_count,
+                settings,
+                focus_store=focus_store,
+            ),
         ]
     }
 
@@ -565,6 +816,47 @@ def build_job_summary_payload(
             ],
         },
     ]
+
+    focus_summary = getattr(state, "focus_store_summary", None)
+    if isinstance(focus_summary, dict) and focus_summary.get("focusStoreFound"):
+        focus_display = focus_summary.get("focusDisplay", {})
+        network_display = focus_summary.get("networkDisplay", {})
+        matched_store = sanitize_store_name(str(focus_summary.get("matchedStore", focus_summary.get("requestedFocusStore", "Focus Store"))))
+        sections.append(
+            {
+                "header": "Focus Store",
+                "widgets": [
+                    {
+                        "decoratedText": {
+                            "topLabel": "Store",
+                            "text": matched_store,
+                            "startIcon": {"knownIcon": "STORE"},
+                        }
+                    },
+                    {
+                        "decoratedText": {
+                            "topLabel": "Store UPH / Network",
+                            "text": f"{focus_display.get('uph', 'N/A')} / {network_display.get('uph', 'N/A')}",
+                            "startIcon": {"knownIcon": "STAR"},
+                        }
+                    },
+                    {
+                        "decoratedText": {
+                            "topLabel": "Store Lates / Network",
+                            "text": f"{focus_display.get('lates', 'N/A')} / {network_display.get('lates', 'N/A')}",
+                            "startIcon": {"knownIcon": "CLOCK"},
+                        }
+                    },
+                    {
+                        "decoratedText": {
+                            "topLabel": "Store INF / Network",
+                            "text": f"{focus_display.get('inf', 'N/A')} / {network_display.get('inf', 'N/A')}",
+                            "startIcon": {"knownIcon": "DESCRIPTION"},
+                        }
+                    },
+                ],
+            }
+        )
 
     if summary["fatal_error_message"]:
         sections.append(

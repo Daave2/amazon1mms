@@ -450,6 +450,7 @@ async def run_extraction(args: argparse.Namespace):
     app_logger.info("Artifacts will be written to %s", run_dir)
 
     state = ScraperState(settings=settings)
+    state.chat_focus_store = args.focus_store
     await state.init_progress(len(selected_stores))
     state.browser_worker_pool_size = settings.fast_path_max_concurrency
     state.form_submitter_count = 0
@@ -594,6 +595,7 @@ async def run_extraction(args: argparse.Namespace):
         end_dt,
         settings.local_timezone,
     )
+    state.focus_store_summary = focus_summary_payload
     focus_summary_markdown = _build_focus_store_markdown(focus_summary_payload)
 
     summary_payload = {
