@@ -35,6 +35,8 @@ on:
         default: Morrisons Thornton Cleveleys
         type: string
   schedule:
+    - cron: "0 0 * * *"
+    - cron: "0 1 * * *"
     - cron: "0 10 * * *"
     - cron: "0 11 * * *"
     - cron: "0 13 * * *"
@@ -50,7 +52,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
-  UK_TARGET_TIMES: "11:00 14:00 17:00 19:30"
+  UK_TARGET_TIMES: "01:00 11:00 14:00 17:00 19:30"
   DEFAULT_FOCUS_STORE: "Morrisons Thornton Cleveleys"
   LOGIN_URL: ${{ secrets.LOGIN_URL }}
   LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
