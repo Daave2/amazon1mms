@@ -15,69 +15,156 @@ on:
         type: boolean
 
   # 2. SCHEDULED RUNS:
-  #    Changed from '0' to '15' to avoid GitHub's high load at the top of the hour.
-  #    This ensures the job starts while it is still the correct hour.
+  #    GitHub cron uses UTC. The night retry window covers 01:00-05:59 London
+  #    in both GMT and BST; a daily marker prevents duplicate full scraper runs.
+  #    Runs away from minute 0 to avoid GitHub's highest scheduler load.
   schedule:
-    - cron: '15 * * * *'
+    - cron: '17,47 0 * * *'
+    - cron: '17,47 1 * * *'
+    - cron: '17,47 2 * * *'
+    - cron: '17,47 3 * * *'
+    - cron: '17,47 4 * * *'
+    - cron: '17,47 5 * * *'
+    - cron: '17,47 19 * * *'
+    - cron: '17,47 20 * * *'
 
-# Abort an older run of the same branch if a new one starts
+# Queue scheduled attempts instead of canceling a scraper that is already running.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
 
   # DEFINE YOUR TARGET UK HOURS HERE (24-hour format)
-  # The main job will only run if the current UK hour is in this list.
-  UK_TARGET_HOURS: '05 01 20'
+  # One successful night run is allowed during 01:00-05:59 London time.
+  UK_TARGET_HOURS: '01 02 03 04 05 20'
   # Refresh the live dropdown snapshot when the cached discovery data is at least this old.
   DROPDOWN_REFRESH_MAX_AGE_DAYS: '7'
 
 jobs:
   # ==============================================================================
   # JOB 1: CHECK TIME
-  # This job runs every hour, checks the current time in London, and decides
+  # This job checks the current time in London and decides
   # whether the main 'scrape-and-submit' job should run.
   # ==============================================================================
   check-time:
     runs-on: ubuntu-latest
     outputs:
       # This output will be 'true' if it's the right time, 'false' otherwise.
-      run_job: ${{ steps.check_hour.outputs.run_job }}
-      current_uk_hour: ${{ steps.check_hour.outputs.current_uk_hour }}
-      gate_reason: ${{ steps.check_hour.outputs.gate_reason }}
+      run_job: ${{ steps.final_gate.outputs.run_job }}
+      current_uk_hour: ${{ steps.plan_run.outputs.current_uk_hour }}
+      gate_reason: ${{ steps.final_gate.outputs.gate_reason }}
+      run_marker_key: ${{ steps.plan_run.outputs.run_marker_key }}
+      run_window: ${{ steps.plan_run.outputs.run_window }}
+      scheduled_target_hour: ${{ steps.plan_run.outputs.scheduled_target_hour }}
     steps:
-      - name: Check current UK hour against target hours
-        id: check_hour
+      - name: Plan scheduled run window
+        id: plan_run
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger detected. The main job will run."
-            echo "run_job=true" >> $GITHUB_OUTPUT
             echo "current_uk_hour=manual" >> $GITHUB_OUTPUT
-            echo "gate_reason=manual_dispatch" >> $GITHUB_OUTPUT
-            {
-              echo "## Run Gate"
-              echo ""
-              echo "- Trigger: \`workflow_dispatch\`"
-              echo "- Decision: run scraper"
-            } >> $GITHUB_STEP_SUMMARY
+            echo "current_uk_offset=manual" >> $GITHUB_OUTPUT
+            echo "event_schedule=manual" >> $GITHUB_OUTPUT
+            echo "scheduled_target_hour=manual" >> $GITHUB_OUTPUT
+            echo "run_window=manual" >> $GITHUB_OUTPUT
+            echo "run_marker_key=" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # Get the current hour in London timezone (e.g., "09", "10", "17")
-          # Use %H to ensure leading zeros so values match the UK_TARGET_HOURS list
+
           CURRENT_UK_HOUR=$(TZ="Europe/London" date +'%H')
-          echo "Current UK hour is: ${CURRENT_UK_HOUR}"
-          echo "Target hours are: ${{ env.UK_TARGET_HOURS }}"
+          CURRENT_UK_OFFSET=$(TZ="Europe/London" date +'%z')
+          CURRENT_UK_DATE=$(TZ="Europe/London" date +'%Y-%m-%d')
+          EVENT_SCHEDULE="${{ github.event.schedule }}"
+
+          UTC_HOUR=""
+          case "${EVENT_SCHEDULE}" in
+            "17,47 0 * * *") UTC_HOUR="00" ;;
+            "17,47 1 * * *") UTC_HOUR="01" ;;
+            "17,47 2 * * *") UTC_HOUR="02" ;;
+            "17,47 3 * * *") UTC_HOUR="03" ;;
+            "17,47 4 * * *") UTC_HOUR="04" ;;
+            "17,47 5 * * *") UTC_HOUR="05" ;;
+            "17,47 19 * * *") UTC_HOUR="19" ;;
+            "17,47 20 * * *") UTC_HOUR="20" ;;
+          esac
+
+          SCHEDULED_TARGET_HOUR=""
+          if [ -n "${UTC_HOUR}" ]; then
+            if [ "${CURRENT_UK_OFFSET}" = "+0100" ]; then
+              SCHEDULED_TARGET_HOUR=$(printf "%02d" $(((10#${UTC_HOUR} + 1) % 24)))
+            else
+              SCHEDULED_TARGET_HOUR="${UTC_HOUR}"
+            fi
+          fi
+
+          RUN_WINDOW=""
+          RUN_MARKER_KEY=""
+          if [[ " 01 02 03 04 05 " =~ " ${CURRENT_UK_HOUR} " ]]; then
+            RUN_WINDOW="night"
+            RUN_MARKER_KEY="scraper-night-${CURRENT_UK_DATE}"
+          elif [ "${CURRENT_UK_HOUR}" = "20" ]; then
+            RUN_WINDOW="evening"
+            RUN_MARKER_KEY="scraper-evening-${CURRENT_UK_DATE}"
+          fi
+
           echo "current_uk_hour=${CURRENT_UK_HOUR}" >> $GITHUB_OUTPUT
-          # Check if the current hour is in our list of target hours
-          if [[ " ${{ env.UK_TARGET_HOURS }} " =~ " ${CURRENT_UK_HOUR} " ]]; then
+          echo "current_uk_offset=${CURRENT_UK_OFFSET}" >> $GITHUB_OUTPUT
+          echo "event_schedule=${EVENT_SCHEDULE}" >> $GITHUB_OUTPUT
+          echo "scheduled_target_hour=${SCHEDULED_TARGET_HOUR}" >> $GITHUB_OUTPUT
+          echo "run_window=${RUN_WINDOW}" >> $GITHUB_OUTPUT
+          echo "run_marker_key=${RUN_MARKER_KEY}" >> $GITHUB_OUTPUT
+
+      - name: Download success marker
+        if: steps.plan_run.outputs.run_marker_key != ''
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: ${{ steps.plan_run.outputs.run_marker_key }}
+          path: .run-lock
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Finalize run gate
+        id: final_gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_UK_HOUR: ${{ steps.plan_run.outputs.current_uk_hour }}
+          CURRENT_UK_OFFSET: ${{ steps.plan_run.outputs.current_uk_offset }}
+          EVENT_SCHEDULE: ${{ steps.plan_run.outputs.event_schedule }}
+          SCHEDULED_TARGET_HOUR: ${{ steps.plan_run.outputs.scheduled_target_hour }}
+          RUN_WINDOW: ${{ steps.plan_run.outputs.run_window }}
+          RUN_MARKER_KEY: ${{ steps.plan_run.outputs.run_marker_key }}
+        run: |
+          MARKER_FOUND=false
+          if [ -d ".run-lock" ] && [ -n "$(find .run-lock -type f -print -quit)" ]; then
+            MARKER_FOUND=true
+          fi
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected. The main job will run."
+            echo "run_job=true" >> $GITHUB_OUTPUT
+            echo "gate_reason=manual_dispatch" >> $GITHUB_OUTPUT
+            DECISION="run scraper"
+          elif [ -z "${RUN_MARKER_KEY}" ]; then
+            echo "This scheduled slot is outside the target windows."
+            echo "run_job=false" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_window_skip" >> $GITHUB_OUTPUT
+            DECISION="skip scraper"
+          elif [ "${MARKER_FOUND}" = "true" ]; then
+            echo "A success marker already exists for ${RUN_MARKER_KEY}."
+            echo "run_job=false" >> $GITHUB_OUTPUT
+            echo "gate_reason=scheduled_marker_exists" >> $GITHUB_OUTPUT
+            DECISION="skip scraper"
+          elif [[ " ${{ env.UK_TARGET_HOURS }} " =~ " ${CURRENT_UK_HOUR} " ]]; then
             echo "It's a target time. The main job will run."
             echo "run_job=true" >> $GITHUB_OUTPUT
             echo "gate_reason=scheduled_window_match" >> $GITHUB_OUTPUT
             DECISION="run scraper"
           else
-            echo "Not a target time. The main job will be skipped."
+            echo "The scheduled target hour is not enabled."
             echo "run_job=false" >> $GITHUB_OUTPUT
             echo "gate_reason=scheduled_window_skip" >> $GITHUB_OUTPUT
             DECISION="skip scraper"
@@ -85,8 +172,14 @@ jobs:
           {
             echo "## Run Gate"
             echo ""
-            echo "- Trigger: \`schedule\`"
+            echo "- Trigger: \`${EVENT_NAME}\`"
             echo "- Current London hour: \`${CURRENT_UK_HOUR}\`"
+            echo "- Current London UTC offset: \`${CURRENT_UK_OFFSET}\`"
+            echo "- Event schedule: \`${EVENT_SCHEDULE}\`"
+            echo "- Scheduled London target hour: \`${SCHEDULED_TARGET_HOUR:-none}\`"
+            echo "- Run window: \`${RUN_WINDOW:-none}\`"
+            echo "- Success marker: \`${RUN_MARKER_KEY:-none}\`"
+            echo "- Success marker already exists: \`${MARKER_FOUND}\`"
             echo "- Allowed hours: \`${{ env.UK_TARGET_HOURS }}\`"
             echo "- Decision: ${DECISION}"
           } >> $GITHUB_STEP_SUMMARY
@@ -159,6 +252,35 @@ jobs:
 
     - name: Run scraper
       run: python scraper.py
+
+    - name: Write success marker
+      if: success() && needs.check-time.outputs.run_marker_key != ''
+      env:
+        RUN_MARKER_KEY: ${{ needs.check-time.outputs.run_marker_key }}
+        RUN_WINDOW: ${{ needs.check-time.outputs.run_window }}
+        CURRENT_UK_HOUR: ${{ needs.check-time.outputs.current_uk_hour }}
+        SCHEDULED_TARGET_HOUR: ${{ needs.check-time.outputs.scheduled_target_hour }}
+      run: |
+        mkdir -p output/run_markers
+        {
+          echo "marker_key=${RUN_MARKER_KEY}"
+          echo "run_window=${RUN_WINDOW}"
+          echo "current_uk_hour=${CURRENT_UK_HOUR}"
+          echo "scheduled_target_hour=${SCHEDULED_TARGET_HOUR}"
+          echo "workflow_run_id=${GITHUB_RUN_ID}"
+          echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
+          echo "created_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        } > "output/run_markers/${RUN_MARKER_KEY}.txt"
+
+    - name: Upload success marker
+      if: success() && needs.check-time.outputs.run_marker_key != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ needs.check-time.outputs.run_marker_key }}
+        path: output/run_markers/${{ needs.check-time.outputs.run_marker_key }}.txt
+        if-no-files-found: error
+        retention-days: 14
+        overwrite: true
 
     - name: Write GitHub step summary
       if: always()
