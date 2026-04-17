@@ -1,8 +1,9 @@
 from datetime import datetime
 from math import trunc
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
+from core.config import FORM_STORE_NAME_MAPPINGS, STORE_PREFIX_RE
 from core.schemas import AmazonShopperRecord
 
 LOCAL_TIMEZONE = ZoneInfo("Europe/London")
@@ -97,18 +98,36 @@ def format_time_available(milliseconds_from_api: float) -> str:
     return f"{total_hours}:{remaining_minutes:02d}"
 
 
+def normalize_form_store_name(
+    store_name: str,
+    form_store_name_mappings: Mapping[str, str] | None = None,
+) -> str:
+    cleaned_name = store_name.strip()
+    mappings = form_store_name_mappings or FORM_STORE_NAME_MAPPINGS
+    mapped_name = mappings.get(cleaned_name)
+    if mapped_name:
+        return mapped_name
+
+    if "morrison" not in cleaned_name.lower():
+        return cleaned_name
+
+    old_store_name = STORE_PREFIX_RE.sub("", cleaned_name).strip()
+    return f"Morrisons - {old_store_name}" if old_store_name else cleaned_name
+
+
 def build_form_data(
     store_name: str,
     normalized_metrics: dict[str, float],
     current_dt: datetime | None = None,
     local_timezone: ZoneInfo = LOCAL_TIMEZONE,
+    form_store_name_mappings: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     current_date = (current_dt or datetime.now(local_timezone)).strftime("%Y-%m-%d")
     lates_val = normalized_metrics.get("LatePicksRate", 0.0)
 
     return {
         "date": current_date,
-        "store": store_name,
+        "store": normalize_form_store_name(store_name, form_store_name_mappings),
         "orders": str(int(normalized_metrics.get("OrdersShopped_V2") or 0)),
         "units": str(int(normalized_metrics.get("RequestedQuantity_V2") or 0)),
         "fulfilled": str(int(normalized_metrics.get("PickedUnits_V2") or 0)),

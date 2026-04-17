@@ -483,7 +483,12 @@ def build_store_submission(
         detail_metrics = normalize_metrics_payload(detail_api_data)
         normalized_metrics["LatePicksRate"] = detail_metrics.get("LatePicksRate", 0.0)
         normalized_metrics["OrderCancellations"] = detail_metrics.get("OrderCancellations", 0.0)
-    form_data = build_form_data(store_name, normalized_metrics, local_timezone=settings.local_timezone)
+    form_data = build_form_data(
+        store_name,
+        normalized_metrics,
+        local_timezone=settings.local_timezone,
+        form_store_name_mappings=settings.form_store_name_mappings,
+    )
     return form_data, normalized_metrics
 
 

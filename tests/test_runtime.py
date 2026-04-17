@@ -560,7 +560,7 @@ async def test_process_ui_store_collects_metrics_and_updates_cache(monkeypatch):
 
     queued = await submission_queue.get()
 
-    assert queued["store"] == "Belle Vale Morrisons"
+    assert queued["store"] == "Morrisons - Belle Vale"
     assert queued["orders"] == "8"
     assert state.run_failures == []
     assert (
@@ -602,7 +602,7 @@ async def test_fast_path_worker_completes_without_creating_page():
 
     queued = await submission_queue.get()
 
-    assert queued["store"] == "Belle Vale Morrisons"
+    assert queued["store"] == "Morrisons - Belle Vale"
     assert browser.created_contexts[0].new_page_calls == 0
     assert ui_queue.empty()
 

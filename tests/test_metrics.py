@@ -2,7 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from core.config import load_settings
-from core.metrics import build_form_data, normalize_metrics_payload
+from core.metrics import build_form_data, normalize_form_store_name, normalize_metrics_payload
 
 
 def test_normalize_metrics_payload_for_single_summary_object():
@@ -30,9 +30,32 @@ def test_normalize_metrics_payload_for_single_summary_object():
     assert normalized["OrdersShopped_V2"] == 12
     assert normalized["AverageUPH_V2"] == 88.6
     assert form_data["date"] == "2026-04-02"
+    assert form_data["store"] == "Morrisons - Belle Vale"
     assert form_data["uph"] == "89"
     assert form_data["lates"] == "2.4 %"
     assert form_data["time_available"] == "1:30"
+
+
+def test_normalize_form_store_name_uses_old_form_store_labels():
+    assert normalize_form_store_name("Morrisons Auckland") == "Morrisons - Bishop Auckland"
+    assert normalize_form_store_name("Morrisons Analby") == "Morrisons - Hull"
+    assert normalize_form_store_name("Bradford") == "Morrisons - Thornbury"
+    assert normalize_form_store_name("Morrisons Cardiff Tygals") == "Morrisons - Cardiff"
+    assert normalize_form_store_name("Catcliffe Morrisons") == "Morrisons - Sheffield"
+    assert normalize_form_store_name("Morrisons Harrow - Trident Point") == "Morrisons - Harrow"
+    assert normalize_form_store_name("Carterton Morrisons") == "Morrisons - Oxford"
+    assert normalize_form_store_name("Morrisons Stevenson") == "Morrisons - Stevenston"
+    assert normalize_form_store_name("Morrisons Thornton Cleveleys") == "Morrisons - Thornton-Cleveleys"
+    assert normalize_form_store_name("Morrisons Welwyn") == "Morrisons - Welwyn Garden City"
+
+
+def test_normalize_form_store_name_standardizes_old_form_style():
+    assert normalize_form_store_name("Acton") == "Morrisons - Acton"
+    assert normalize_form_store_name("Belle Vale Morrisons") == "Morrisons - Belle Vale"
+    assert normalize_form_store_name("Morrisons York") == "Morrisons - York"
+    assert normalize_form_store_name("St Helens Morrisons") == "Morrisons - St. Helens"
+    assert normalize_form_store_name("Morrisons Bedford") == "Morrisons - Bedford"
+    assert normalize_form_store_name("Network") == "Network"
 
 
 def test_normalize_metrics_payload_for_detailed_records_deduplicates_profiles():
@@ -169,6 +192,7 @@ def test_build_store_submission_overlays_lates_and_cancellations_from_detail_pay
     assert normalized["PickedUnits_V2"] == 6675
     assert normalized["LatePicksRate"] == 0.7462686567164178
     assert normalized["OrderCancellations"] == 2
+    assert form_data["store"] == "Morrisons - Welwyn Garden City"
     assert form_data["lates"] == "0.7 %"
     assert form_data["cancelled"] == "2"
 

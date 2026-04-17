@@ -24,6 +24,7 @@ def test_selection_matches_target_tolerates_formatting_variants():
 
 def test_resolve_dropdown_name_applies_special_store_mappings():
     assert resolve_dropdown_name("Morrisons Cardiff Tygals") == "cardiff tyglass"
+    assert resolve_dropdown_name("Morrisons Auckland") == "bishop auckland"
     assert resolve_dropdown_name("Oxford") == "carterton"
     assert resolve_dropdown_name("Morrisons Weston Super Mare") == "weston-super-mare"
 
