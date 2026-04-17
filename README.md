@@ -343,6 +343,8 @@ The workflow also:
 This artifact-based persistence is what allows the scraper to keep its auth state and fast-path cache across runs.
 The uploaded `output/` directory includes `run_summary.json` and `failure_events.json`, which are the main operator-facing artifacts for run triage.
 
+The workflow in [`.github/workflows/day-so-far-chat.yml`](./.github/workflows/day-so-far-chat.yml) posts a daily day-so-far network report to Google Chat. It runs once per day for the London 13:00 reporting slot, with separate UTC cron entries for GMT and BST, and can also be started manually. Scheduled runs pin the extract window to `00:00 -> 13:00` London time for the current day, so a delayed GitHub runner does not accidentally include the next hour. Configure the Chat destination with the `DAY_SO_FAR_CHAT_WEBHOOK_URL` repository secret; if that secret is absent, the workflow falls back to `CHAT_WEBHOOK_URL`.
+
 The lightweight validation workflow in [`.github/workflows/validate.yml`](./.github/workflows/validate.yml) is kept separate from the production scheduler and runs `compileall` plus `pytest` with terminal coverage output.
 
 ## Operator Playbook

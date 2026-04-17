@@ -1,0 +1,259 @@
+name: Day So Far Chat Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      focus_store:
+        description: Optional store to highlight against the full network report. Leave blank for a network-only report.
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # GitHub cron is UTC. These two slots cover 13:00 London during BST and GMT.
+    - cron: "0 12 * * *"
+    - cron: "0 13 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  LONDON_TARGET_HOUR: "13"
+  LOGIN_URL: ${{ secrets.LOGIN_URL }}
+  LOGIN_EMAIL: ${{ secrets.LOGIN_EMAIL }}
+  LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+  OTP_SECRET_KEY: ${{ secrets.OTP_SECRET_KEY }}
+  TARGET_URL: ${{ secrets.TARGET_URL || 'https://sellercentral.amazon.co.uk/snowdash/ref=xx_shopdash_dnav_xx' }}
+  FORM_POST_URL: ${{ secrets.FORM_POST_URL || 'https://docs.google.com/forms/d/e/1FAIpQLSefktpkvAEYtT8pgYknAdWH_GmopNb-QLrmtTS-ijrBTc1hew/formResponse' }}
+  CHAT_WEBHOOK_URL: ${{ secrets.DAY_SO_FAR_CHAT_WEBHOOK_URL || secrets.CHAT_WEBHOOK_URL }}
+
+jobs:
+  check-time:
+    runs-on: ubuntu-latest
+    outputs:
+      run_job: ${{ steps.plan_run.outputs.run_job }}
+      current_uk_time: ${{ steps.plan_run.outputs.current_uk_time }}
+      current_uk_offset: ${{ steps.plan_run.outputs.current_uk_offset }}
+      gate_reason: ${{ steps.plan_run.outputs.gate_reason }}
+
+    steps:
+      - name: Plan day-so-far run
+        id: plan_run
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          CURRENT_UK_TIME=$(TZ="Europe/London" date +'%H:%M')
+          CURRENT_UK_DATE=$(TZ="Europe/London" date +'%Y-%m-%d')
+          CURRENT_UK_OFFSET=$(TZ="Europe/London" date +'%z')
+
+          echo "current_uk_time=${CURRENT_UK_TIME}" >> "$GITHUB_OUTPUT"
+          echo "current_uk_offset=${CURRENT_UK_OFFSET}" >> "$GITHUB_OUTPUT"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            RUN_JOB=true
+            GATE_REASON=manual_dispatch
+            DECISION="run day-so-far extract"
+          elif [ "${EVENT_SCHEDULE}" = "0 12 * * *" ] && [ "${CURRENT_UK_OFFSET}" = "+0100" ]; then
+            RUN_JOB=true
+            GATE_REASON=scheduled_bst_slot
+            DECISION="run day-so-far extract"
+          elif [ "${EVENT_SCHEDULE}" = "0 13 * * *" ] && [ "${CURRENT_UK_OFFSET}" = "+0000" ]; then
+            RUN_JOB=true
+            GATE_REASON=scheduled_gmt_slot
+            DECISION="run day-so-far extract"
+          else
+            RUN_JOB=false
+            GATE_REASON=scheduled_dst_guard_skip
+            DECISION="skip day-so-far extract"
+          fi
+
+          echo "run_job=${RUN_JOB}" >> "$GITHUB_OUTPUT"
+          echo "gate_reason=${GATE_REASON}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Day So Far Gate"
+            echo ""
+            echo "- Trigger: \`${EVENT_NAME}\`"
+            echo "- Event schedule: \`${EVENT_SCHEDULE:-manual}\`"
+            echo "- Current London time: \`${CURRENT_UK_TIME}\`"
+            echo "- Current London UTC offset: \`${CURRENT_UK_OFFSET}\`"
+            echo "- Target extract window: \`${CURRENT_UK_DATE} 00:00 -> ${CURRENT_UK_DATE} ${LONDON_TARGET_HOUR}:00\`"
+            echo "- Decision: ${DECISION}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  extract-and-post:
+    needs: check-time
+    if: needs.check-time.outputs.run_job == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Check chat webhook secret
+        shell: bash
+        run: |
+          if [ -z "${CHAT_WEBHOOK_URL}" ]; then
+            echo "::error::Configure DAY_SO_FAR_CHAT_WEBHOOK_URL, or set CHAT_WEBHOOK_URL to the day-so-far Google Chat webhook."
+            exit 1
+          fi
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright browser
+        run: python -m playwright install chromium
+
+      - name: Download Persistent Data (Fast Path Cache)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: persistent-discovery-data
+          path: .
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Download auth state from previous run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: run-scraper.yml
+          name: auth-state
+          path: .
+          if_no_artifact_found: warn
+          search_artifacts: true
+
+      - name: Ensure auth state is valid
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          from pathlib import Path
+
+          from playwright.async_api import async_playwright
+
+          from core.config import load_settings
+          from core.utils import optimize_browser_context, safe_close
+          from services.auth_service import check_if_login_needed, prime_master_session
+
+          async def main():
+              settings = load_settings()
+              state_path = Path(settings.storage_state_path)
+
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  try:
+                      session_valid = False
+                      if state_path.exists():
+                          context = await browser.new_context(storage_state=str(state_path))
+                          await optimize_browser_context(context, settings)
+                          page = await context.new_page()
+                          try:
+                              session_valid = not await check_if_login_needed(page, settings.base_dashboard_url, settings)
+                          finally:
+                              await safe_close(page, "Day so far auth check page")
+                              await safe_close(context, "Day so far auth check context")
+
+                      if session_valid:
+                          print("Existing auth state is valid.")
+                          return
+
+                      print("Auth state missing or expired. Priming a fresh session.")
+                      success = await prime_master_session(browser, settings)
+                      if not success:
+                          raise RuntimeError("Failed to prime a fresh auth session for the day-so-far workflow.")
+                  finally:
+                      await safe_close(browser, "Day so far auth browser")
+
+          asyncio.run(main())
+          PY
+
+      - name: Extract day so far and post to Chat
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_FOCUS_STORE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.focus_store || '' }}
+        run: |
+          extract_args=(--focus-store "${INPUT_FOCUS_STORE}")
+
+          if [ "${EVENT_NAME}" = "schedule" ]; then
+            RUN_DATE=$(TZ="Europe/London" date +'%Y-%m-%d')
+            extract_args+=(--window-preset custom --start "${RUN_DATE} 00" --end "${RUN_DATE} ${LONDON_TARGET_HOUR}")
+          else
+            extract_args+=(--window-preset today)
+          fi
+
+          python scripts/manual/extract_metrics_window.py "${extract_args[@]}"
+
+      - name: Upload day-so-far artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: day-so-far-extract-${{ github.run_id }}
+          path: |
+            output/
+            app.log
+            state.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write day-so-far summary
+        if: always()
+        env:
+          GATE_CURRENT_UK_TIME: ${{ needs.check-time.outputs.current_uk_time }}
+          GATE_REASON: ${{ needs.check-time.outputs.gate_reason }}
+          INPUT_FOCUS_STORE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.focus_store || '' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from core.reporting import build_github_step_summary_markdown
+
+          gate_reason = os.getenv("GATE_REASON", "")
+          gate_time = os.getenv("GATE_CURRENT_UK_TIME", "")
+          summary_path = Path("output/run_summary.json")
+
+          if summary_path.exists():
+              summary = json.loads(summary_path.read_text(encoding="utf-8"))
+              markdown = build_github_step_summary_markdown(
+                  summary,
+                  gate_reason=gate_reason,
+                  gate_hour=gate_time,
+              )
+          else:
+              markdown = "\n".join(
+                  [
+                      "## Day So Far Chat Report",
+                      "",
+                      "Runtime summary was not generated. Check the extraction logs and uploaded artifacts.",
+                      "",
+                  ]
+              )
+
+          focus_summary_path = Path("output/focus_store_summary.md")
+          if os.getenv("INPUT_FOCUS_STORE", "").strip() and focus_summary_path.exists():
+              markdown += "\n" + focus_summary_path.read_text(encoding="utf-8")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(markdown)
+          PY
