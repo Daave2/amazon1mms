@@ -126,6 +126,11 @@ async def safe_close(resource, label: str, failure_recorder=None):
 
         await resource.close()
     except Exception as exc:
+        message = str(exc)
+        if "has been closed" in message or "Target closed" in message:
+            app_logger.debug(f"{label} was already closed during cleanup.")
+            return
+
         app_logger.warning(f"Failed to close {label}: {exc}")
         if failure_recorder:
             await failure_recorder(

@@ -1,7 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from scripts.manual.extract_metrics_window import _build_focus_store_summary
+from scripts.manual.extract_metrics_window import _build_focus_store_summary, _build_no_focus_summary
 
 
 LONDON = ZoneInfo("Europe/London")
@@ -107,3 +107,21 @@ def test_build_focus_store_summary_highlights_focus_store_against_network():
     assert round(summary["shares"]["ordersPct"], 3) == round(120 / 390 * 100, 3)
     assert summary["rankings"]["uph"]["position"] == 1
     assert summary["rankings"]["lates"]["guidance"] == "Lower is better"
+
+
+def test_build_no_focus_summary_keeps_network_extract_metadata_only():
+    start = datetime(2026, 4, 17, 0, 0, tzinfo=LONDON)
+    end = datetime(2026, 4, 17, 13, 0, tzinfo=LONDON)
+
+    summary = _build_no_focus_summary([{"store": "Morrisons York"}], "custom", start, end)
+
+    assert summary == {
+        "requestedFocusStore": "",
+        "focusStoreFound": False,
+        "storeCount": 1,
+        "windowName": "custom",
+        "windowStart": "2026-04-17T00:00:00+01:00",
+        "windowEnd": "2026-04-17T13:00:00+01:00",
+        "allStoresIncluded": True,
+        "allStoresCsv": "summary.csv",
+    }

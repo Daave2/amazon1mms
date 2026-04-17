@@ -189,16 +189,15 @@ jobs:
       - name: Extract day so far and post to Chat
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_FOCUS_STORE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.focus_store || '' }}
         run: |
-          extract_args=(--focus-store "${INPUT_FOCUS_STORE}")
+          RUN_DATE=$(TZ="Europe/London" date +'%Y-%m-%d')
+          extract_args=(--window-preset custom --start "${RUN_DATE} 00" --end "${RUN_DATE} ${LONDON_TARGET_HOUR}")
 
-          if [ "${EVENT_NAME}" = "schedule" ]; then
-            RUN_DATE=$(TZ="Europe/London" date +'%Y-%m-%d')
-            extract_args+=(--window-preset custom --start "${RUN_DATE} 00" --end "${RUN_DATE} ${LONDON_TARGET_HOUR}")
+          if [ -n "${INPUT_FOCUS_STORE}" ]; then
+            extract_args+=(--focus-store "${INPUT_FOCUS_STORE}")
           else
-            extract_args+=(--window-preset today)
+            extract_args+=(--no-focus-store)
           fi
 
           python scripts/manual/extract_metrics_window.py "${extract_args[@]}"

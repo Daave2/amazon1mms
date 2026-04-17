@@ -74,6 +74,11 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_FOCUS_STORE,
         help="Store to highlight in the comparison summary while still extracting all stores.",
     )
+    parser.add_argument(
+        "--no-focus-store",
+        action="store_true",
+        help="Skip focus-store comparison output and post the full-network summary only.",
+    )
     return parser.parse_args()
 
 
@@ -333,6 +338,24 @@ def _build_focus_store_summary(
     return summary
 
 
+def _build_no_focus_summary(
+    results: list[dict[str, Any]],
+    window_name: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> dict[str, Any]:
+    return {
+        "requestedFocusStore": "",
+        "focusStoreFound": False,
+        "storeCount": len(results),
+        "windowName": window_name,
+        "windowStart": start_dt.isoformat(),
+        "windowEnd": end_dt.isoformat(),
+        "allStoresIncluded": True,
+        "allStoresCsv": "summary.csv",
+    }
+
+
 def _build_focus_store_markdown(summary: dict[str, Any]) -> str:
     lines = ["## Focus Store Comparison", ""]
     lines.append(f"- Focus store requested: `{summary['requestedFocusStore']}`")
@@ -410,6 +433,7 @@ class ExtractSubmissionManager(SubmissionManager):
 
 async def run_extraction(args: argparse.Namespace):
     settings = load_settings()
+    focus_store = "" if args.no_focus_store else args.focus_store.strip()
     ensure_directory(settings.output_dir)
     configure_logging(settings)
     storage_state_path = Path(settings.storage_state_path)
@@ -444,13 +468,16 @@ async def run_extraction(args: argparse.Namespace):
         app_logger.info("Store filter requested: %s", args.stores)
     else:
         app_logger.info("No store filter provided. Extracting all configured stores with merchant ids.")
-    app_logger.info("Focus store for comparison output: %s", args.focus_store)
+    if focus_store:
+        app_logger.info("Focus store for comparison output: %s", focus_store)
+    else:
+        app_logger.info("No focus store requested. Extracting and posting the full-network summary only.")
     app_logger.info("Discovery cache template available: %s", bool(cache.api_url_template))
     app_logger.info("%s stores selected for extraction.", len(selected_stores))
     app_logger.info("Artifacts will be written to %s", run_dir)
 
     state = ScraperState(settings=settings)
-    state.chat_focus_store = args.focus_store
+    state.chat_focus_store = focus_store
     await state.init_progress(len(selected_stores))
     state.browser_worker_pool_size = settings.fast_path_max_concurrency
     state.form_submitter_count = 0
@@ -587,16 +614,20 @@ async def run_extraction(args: argparse.Namespace):
     results.sort(key=lambda item: item["store"].lower())
     failures.sort(key=lambda item: item["store"].lower())
 
-    focus_summary_payload = _build_focus_store_summary(
-        results,
-        args.focus_store,
-        resolved_window_name,
-        start_dt,
-        end_dt,
-        settings.local_timezone,
-    )
+    if focus_store:
+        focus_summary_payload = _build_focus_store_summary(
+            results,
+            focus_store,
+            resolved_window_name,
+            start_dt,
+            end_dt,
+            settings.local_timezone,
+        )
+        focus_summary_markdown = _build_focus_store_markdown(focus_summary_payload)
+    else:
+        focus_summary_payload = _build_no_focus_summary(results, resolved_window_name, start_dt, end_dt)
+        focus_summary_markdown = ""
     state.focus_store_summary = focus_summary_payload
-    focus_summary_markdown = _build_focus_store_markdown(focus_summary_payload)
 
     summary_payload = {
         "windowName": resolved_window_name,
@@ -604,20 +635,22 @@ async def run_extraction(args: argparse.Namespace):
         "windowEnd": end_dt.isoformat(),
         "storeCount": len(results),
         "failureCount": len(failures),
-        "requestedFocusStore": args.focus_store,
+        "requestedFocusStore": focus_store,
         "focusStoreFound": focus_summary_payload.get("focusStoreFound", False),
         "failures": failures,
         "focusStoreSummary": focus_summary_payload,
         "stores": results,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-    (run_dir / "focus_store_summary.json").write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
-    (run_dir / "focus_store_summary.md").write_text(focus_summary_markdown, encoding="utf-8")
 
-    stable_focus_json = REPO_ROOT / settings.output_dir / "focus_store_summary.json"
-    stable_focus_markdown = REPO_ROOT / settings.output_dir / "focus_store_summary.md"
-    stable_focus_json.write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
-    stable_focus_markdown.write_text(focus_summary_markdown, encoding="utf-8")
+    if focus_store:
+        (run_dir / "focus_store_summary.json").write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
+        (run_dir / "focus_store_summary.md").write_text(focus_summary_markdown, encoding="utf-8")
+
+        stable_focus_json = REPO_ROOT / settings.output_dir / "focus_store_summary.json"
+        stable_focus_markdown = REPO_ROOT / settings.output_dir / "focus_store_summary.md"
+        stable_focus_json.write_text(json.dumps(focus_summary_payload, indent=2), encoding="utf-8")
+        stable_focus_markdown.write_text(focus_summary_markdown, encoding="utf-8")
 
     csv_path = run_dir / "summary.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -672,14 +705,16 @@ async def run_extraction(args: argparse.Namespace):
         len(failures),
         run_dir,
     )
-    if focus_summary_payload.get("focusStoreFound"):
+    if not focus_store:
+        app_logger.info("No focus store comparison requested.")
+    elif focus_summary_payload.get("focusStoreFound"):
         app_logger.info(
             "Focus store summary ready for %s against %s stores.",
             focus_summary_payload.get("matchedStore"),
             focus_summary_payload.get("storeCount"),
         )
     else:
-        app_logger.warning("Focus store %s was not found in the extracted store set.", args.focus_store)
+        app_logger.warning("Focus store %s was not found in the extracted store set.", focus_store)
 
     print(f"Output: {run_dir}")
     print(f"Window: {start_dt.isoformat()} -> {end_dt.isoformat()}")
