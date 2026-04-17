@@ -237,6 +237,37 @@ def test_filter_stores_to_live_dropdown_queues_all_live_stores_and_uses_live_mer
     assert [store["store_name"] for store in skipped] == ["Morrisons Missing Store"]
 
 
+def test_filter_stores_to_live_dropdown_matches_bradford_live_option_to_thornbury_store():
+    urls_data = [
+        {
+            "store_name": "Thornbury Morrisons",
+            "merchant_id": "",
+            "marketplace_id": "",
+            "dropdown_name": "Thornbury",
+        },
+    ]
+    available_stores = [
+        {
+            "store_name": "Bradford",
+            "normalized_name": "thornbury",
+            "merchant_id": "LIVE-BRADFORD-ID",
+        },
+    ]
+
+    filtered, skipped = scraper.filter_stores_to_live_dropdown(urls_data, available_stores)
+
+    assert filtered == [
+        {
+            "store_name": "Thornbury Morrisons",
+            "dropdown_name": "Bradford",
+            "merchant_id": "LIVE-BRADFORD-ID",
+            "marketplace_id": "",
+            "matched_from_configured": True,
+        }
+    ]
+    assert skipped == []
+
+
 def test_route_store_work_items_prefers_fast_path_when_template_and_merchant_id_exist():
     state = ScraperState()
     state.cache_template_available_at_start = True

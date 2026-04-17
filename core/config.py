@@ -10,6 +10,7 @@ STORE_PREFIX_RE = re.compile(r"^morrisons?\s*-?\s*|\s*-?\s*morrisons?$", re.I)
 SPECIAL_NAME_MAPPINGS = {
     "analby": "anlaby",
     "baglan moor": "baglan",
+    "bradford": "thornbury",
     "cardiff tygals": "cardiff tyglass",
     "connahs quay": "connahs quays",
     "oxford": "carterton",
