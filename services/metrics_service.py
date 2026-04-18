@@ -40,15 +40,30 @@ def resolve_dropdown_name(store_name: str, settings: Settings | None = None) -> 
     return dropdown_name
 
 
-def _build_search_terms(dropdown_name: str, store_name: str) -> list[str]:
+def _build_search_terms(dropdown_name: str, store_name: str, settings: Settings | None = None) -> list[str]:
+    resolved_dropdown_name = resolve_dropdown_name(dropdown_name, settings)
+    resolved_store_name = resolve_dropdown_name(store_name, settings)
+    special_name_mappings = settings.special_name_mappings if settings else SPECIAL_NAME_MAPPINGS
+    canonical_targets = {resolved_dropdown_name, resolved_store_name}
+    alias_terms = [
+        alias
+        for alias, canonical_name in special_name_mappings.items()
+        if canonical_name in canonical_targets
+    ]
+
     raw_terms = [
         dropdown_name,
         dropdown_name.replace("-", " "),
         dropdown_name.replace(" ", "-"),
+        resolved_dropdown_name,
+        resolved_dropdown_name.replace("-", " "),
+        resolved_dropdown_name.replace(" ", "-"),
+        *alias_terms,
         normalize_name(store_name),
         store_name,
         re.sub(r"(?i)\s*morrisons?$", "", store_name).strip(),
         re.sub(r"(?i)^morrisons?\s*", "", store_name).strip(),
+        resolved_store_name,
     ]
 
     search_terms: list[str] = []
@@ -347,7 +362,7 @@ async def _select_option_without_search_input(
     store_name: str,
     settings: Settings,
 ) -> bool:
-    for search_term in _build_search_terms(dropdown_name, store_name):
+    for search_term in _build_search_terms(dropdown_name, store_name, settings):
         try:
             if await _select_option_via_overlay_text(page, search_term, store_name, settings):
                 selected_text = await _current_store_selector_text(page)
@@ -594,7 +609,7 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
 
     if search_input:
         await search_input.first.click()
-    search_terms = _build_search_terms(dropdown_name, store_name)
+    search_terms = _build_search_terms(dropdown_name, store_name, settings)
     for index, search_term in enumerate(search_terms):
         if search_input:
             await search_input.first.fill(search_term)
@@ -629,7 +644,7 @@ async def select_store_from_dropdown(page: Page, dropdown_name: str, store_name:
 async def collect_metrics_via_ui(page: Page, work_item: WorkItem, state: ScraperState, timeout: int = METRICS_TIMEOUT):
     settings = state.settings
     store_name = work_item.store_name
-    dropdown_name = resolve_dropdown_name(work_item.dropdown_name, settings)
+    dropdown_name = work_item.dropdown_name.strip() or store_name
     expected_merchant_id = work_item.merchant_id.strip()
 
     dropdown_trigger = page.locator("#store-selector-dropdown")

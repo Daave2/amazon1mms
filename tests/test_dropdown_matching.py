@@ -14,6 +14,12 @@ def test_build_search_terms_includes_normalized_and_original_variants():
     assert "Morrisons Weston Super Mare" in terms
 
 
+def test_build_search_terms_includes_reverse_aliases_for_store_selector_labels():
+    terms = _build_search_terms("Thornbury", "Thornbury Morrisons")
+
+    assert "bradford" in terms
+
+
 def test_selection_matches_target_tolerates_formatting_variants():
     assert _selection_matches_target("Morrisons Weston Super Mare", "weston-super-mare", "Morrisons Weston Super Mare")
     assert _selection_matches_target("Wellington Gardens", "wellington gardens", "Wellington Gardens")

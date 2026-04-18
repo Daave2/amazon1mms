@@ -268,6 +268,37 @@ def test_filter_stores_to_live_dropdown_matches_bradford_live_option_to_thornbur
     assert skipped == []
 
 
+def test_filter_stores_to_live_dropdown_matches_acton_live_option_to_configured_store():
+    urls_data = [
+        {
+            "store_name": "Acton Morrisons",
+            "merchant_id": "",
+            "marketplace_id": "",
+            "dropdown_name": "Acton",
+        },
+    ]
+    available_stores = [
+        {
+            "store_name": "Acton",
+            "normalized_name": "acton",
+            "merchant_id": "LIVE-ACTON-ID",
+        },
+    ]
+
+    filtered, skipped = scraper.filter_stores_to_live_dropdown(urls_data, available_stores)
+
+    assert filtered == [
+        {
+            "store_name": "Acton Morrisons",
+            "dropdown_name": "Acton",
+            "merchant_id": "LIVE-ACTON-ID",
+            "marketplace_id": "",
+            "matched_from_configured": True,
+        }
+    ]
+    assert skipped == []
+
+
 def test_route_store_work_items_prefers_fast_path_when_template_and_merchant_id_exist():
     state = ScraperState()
     state.cache_template_available_at_start = True
